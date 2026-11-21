@@ -1,0 +1,21 @@
+local fp = require 'floating'
+local ct = require 'ctypes'
+
+local function expect(word: string, significand: uint64, sign_exponent: uint16)
+  local got_significand, got_sign_exponent, kind = fp.literal_long_double(word)
+  assert(kind == ct.Kind.LongDouble)
+  assert(got_significand == significand)
+  assert(got_sign_exponent == sign_exponent)
+end
+
+-- The decimal case differs from 1.0 below binary64 precision. The hex cases
+-- exercise round-to-even at half an x87 ULP and the adjacent representable.
+expect('1.0L', 0x8000000000000000_u64, 0x3fff_u16)
+expect('1.0000000000000000001L', 0x8000000000000001_u64, 0x3fff_u16)
+expect('0x1.0000000000000001p0L', 0x8000000000000000_u64, 0x3fff_u16)
+expect('0x1.0000000000000002p0L', 0x8000000000000001_u64, 0x3fff_u16)
+expect('0x1p-16445L', 1_u64, 0_u16)
+expect('-0.0L', 0_u64, 0x8000_u16)
+
+local _, _, invalid = fp.literal_long_double('1.0xL')
+assert(invalid == ct.Kind.Unknown)

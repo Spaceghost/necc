@@ -5,8 +5,16 @@ local K = ct.Kind
 local fp = @record{}
 local FloatBits = @union{f: float32, bits: uint32}
 local DoubleBits = @union{d: float64, bits: uint64}
+-- The supported x86-64 target stores the 80-bit x87 value in the first ten
+-- bytes of its 16-byte long-double object (the remaining bytes are padding).
+-- Keep these fields separate so callers never route an extended constant
+-- through float64 and silently discard its low significand bits.
+local ExtendedPadding = @array(byte,6)
+local ExtendedParts = @record{significand: uint64, sign_exponent: uint16, padding: ExtendedPadding}
+local ExtendedBits = @union{d: clongdouble, parts: ExtendedParts}
 local function strtof(s: cstring, rest: *cstring): cfloat <cimport,cinclude '<stdlib.h>'> end
 local function strtod(s: cstring, rest: *cstring): cdouble <cimport,cinclude '<stdlib.h>'> end
+local function strtold(s: cstring, rest: *cstring): clongdouble <cimport,cinclude '<stdlib.h>'> end
 
 function fp.token(word: string): boolean
   local hex = #word>=2 and word.data[0]==48 and (word.data[1] | 32)==120
@@ -37,6 +45,28 @@ function fp.literal(word: string): (integer,ct.Id)
   word:destroy()
   if not valid then return 0,K.Unknown end
   return n,single and K.Float or K.Double
+end
+
+-- Parse a C long-double token using the target's strtold, then expose its
+-- exact x87 payload. The `L` suffix is stripped because strtold consumes the
+-- numeric spelling and reports the first unparsed character through `rest`.
+-- Decimal and hexadecimal inputs are both handled by the C library's correctly
+-- rounded conversion, including subnormals and values that differ below the
+-- precision of a double.
+function fp.literal_long_double(word: string): (uint64,uint16,ct.Id)
+  if #word < 2 or word:sub(-1):lower() ~= 'l' then return 0,0,K.Unknown end
+  word=word:sub(1,-2)
+  local start=(@cstring)(word)
+  local rest: cstring
+  local u: ExtendedBits
+  u.d=strtold(start,&rest)
+  local tail=(@*byte)(rest)
+  local valid=tail ~= nilptr and rest ~= start and $tail == 0
+  local significand=u.parts.significand
+  local sign_exponent=u.parts.sign_exponent
+  word:destroy()
+  if not valid then return 0,0,K.Unknown end
+  return significand,sign_exponent,K.LongDouble
 end
 
 -- Convert a scalar constant to the destination precision before emitting its bits.
