@@ -1230,7 +1230,7 @@ local function address_initializer(words: *headers.Tokens, first: usize, last: u
   return variable.symbol, addend, ct.pointer(kind)
 end
 
-local function pointer_constant(words: *headers.Tokens, first: usize, last: usize, k: Id): string
+local function address_constant(words: *headers.Tokens, first: usize, last: usize): (string, Id)
   if first > last then fail('expected pointer initializer') end
   if ($words)[first] == '(' then
     local close=first+1
@@ -1241,19 +1241,18 @@ local function pointer_constant(words: *headers.Tokens, first: usize, last: usiz
       if nesting == 0 then break end
       close=close+1
     end
-    if close == last then return pointer_constant(words,first+1,last-1,k) end
+    if close == last then return address_constant(words,first+1,last-1) end
     if close < last and headers.starts_type(($words)[first+1],&aliases) then
       local cast: headers.Tokens
       for i=first+1,close-1 do cast:push(($words)[i]) end
       local d=headers.parse(&cast,&aliases,&enumerators)
       if not ct.is_pointer(d.kind) or #d.name ~= 0 then fail('unsupported address initializer cast') end
-      local symbol=pointer_constant(words,close+1,last,d.kind)
-      if symbol ~= '0' and not compatible_pointer(d.kind,k) then fail('incompatible pointer initializer') end
-      return symbol
+      cast:destroy()
+      local symbol=address_constant(words,close+1,last)
+      return symbol,d.kind
     end
   end
   if ($words)[first]:byte(1) == 34 then
-    if not compatible_pointer(ct.pointer(Kind.Char),k) then fail('incompatible string initializer') end
     local bytes: sequence(byte)
     for i = first,last do
       if ($words)[i]:byte(1) ~= 34 then fail('expected string literal') end
@@ -1261,28 +1260,27 @@ local function pointer_constant(words: *headers.Tokens, first: usize, last: usiz
     end
     bytes:push(0)
     local name = string_symbol(&bytes); bytes:destroy()
-    return name
+    return name,ct.pointer(Kind.Char)
   end
   local name, addend, address_type = address_initializer(words, first, last)
   if address_type ~= Kind.Unknown then
-    if not compatible_pointer(address_type,k) then fail('incompatible address initializer') end
-    return addend == 0 and name or name .. '+' .. tostring(addend)
+    return addend == 0 and name or name .. '+' .. tostring(addend),address_type
   end
   local addr=($words)[first] == '&'
   local at=addr and first+1 or first
   if at == last then
     local name=($words)[at]
     if functions:has(name) then
-      if not compatible_pointer(ct.pointer(ct.function_type(functions[name])),k) then fail('incompatible function pointer') end
-      return name
+      return name,ct.pointer(ct.function_type(functions[name]))
     end
   end
   local expr: ce.Tokens
   for i=first,last do expr:push(($words)[i]) end
   local n,ok=ce.evaluate(&expr, &enumerators, &aliases)
-  if ok and n == 0 then return '0' end
+  expr:destroy()
+  if ok and n == 0 then return '0',Kind.Unknown end
   fail('expected a constant address or null pointer')
-  return ''
+  return '',Kind.Unknown
 end
 
 local function byte_array(k: Id): boolean
@@ -1428,7 +1426,9 @@ local function global_init(k: Id, out: *sequence(string)): Id
   else
     local words=read_constant()
     if ct.is_pointer(k) then
-      out:push('  .quad ' .. pointer_constant(&words,1,#words,k))
+      local symbol,source_type=address_constant(&words,1,#words)
+      if symbol ~= '0' and not compatible_pointer(source_type,k) then fail('incompatible pointer initializer') end
+      out:push('  .quad ' .. symbol)
     elseif ct.floating(k) then
       local bits = floating_initializer(&words, k)
       out:push((k == Kind.Float and '  .long ' or '  .quad ') .. tostring(bits))

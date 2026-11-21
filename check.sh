@@ -78,13 +78,18 @@ static int *decayed_array = node.leaves[1].values;
 static int *one_past = &node.leaves[1].values[3];
 static void *cast_address = (void *)(&node.end);
 static void *null_address = (void *)0;
+struct StringView { unsigned char *bytes; unsigned long size; };
+static struct StringView names[] = {{(unsigned char *)"ab" "cd", 4}};
+static unsigned char *representation = (unsigned char *)&node.leaves[1].values[2];
 int main(void) {
     return *nested_address != 42
         || *field_address != 17
         || *decayed_array != 23
         || one_past != &node.leaves[1].values[3]
         || cast_address != &node.end
-        || null_address != 0;
+        || null_address != 0
+        || names[0].size != 4 || names[0].bytes[3] != 'd'
+        || representation != (unsigned char *)nested_address;
 }
 C
 "$necc" "$out/static-address.c" -o "$out/static-address.s"
@@ -118,6 +123,8 @@ reject_static_address invalid-member 'struct Value { int member; }; static struc
 reject_static_address invalid-bound 'struct Value { int members[2]; }; static struct Value value; static int *invalid = &value.members[3];'
 reject_static_address invalid-index 'struct Value { int members[2]; }; static struct Value value; extern int index; static int *invalid = &value.members[index];'
 reject_static_address invalid-type 'struct Value { int members[2]; }; static struct Value value; static char *invalid = &value.members[0];'
+reject_static_address implicit-string-type 'static unsigned char *bad = "bytes";'
+reject_static_address cast-result-type 'static int *bad = (unsigned char *)"bytes";'
 reject_static_address invalid-one-past-decay 'struct Value { int matrix[2][3]; }; static struct Value value; static int *invalid = value.matrix[2];'
 
 cat > "$out/aggregate-zero.c" <<'C'
