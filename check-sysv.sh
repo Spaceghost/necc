@@ -325,18 +325,14 @@ cat > return_pointer.c <<'C'
 
 int forward(const char *s, va_list ap) { (void)s; (void)ap; return 0; }
 
+/* Call the lowered SysV signature so C reserves a real call frame and
+   leaves the 128-byte red zone available to the callee. */
+extern Large *capture_return_pointer(Large *, long) __asm__("make_large");
+
 int main(void) {
     Large out;
-    Large *destination = &out;
-    long seed = 31;
-    uintptr_t returned;
-    __asm__ volatile("call make_large"
-        : "=a"(returned), "+D"(destination), "+S"(seed)
-        :
-        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory", "cc",
-          "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
-          "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
-    return returned != (uintptr_t)&out || out.a != 31 || out.b != 32 || out.c != 33;
+    Large *returned = capture_return_pointer(&out, 31);
+    return returned != &out || out.a != 31 || out.b != 32 || out.c != 33;
 }
 C
 printf '%s\n' '_Static_assert(0 && (1 / 0), "wrong target");' > wrong.c
