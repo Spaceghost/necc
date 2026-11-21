@@ -689,7 +689,160 @@ local function transfer_record_result(k: Id, returning: boolean)
   elseif gp > 0 then emit('movq %r10, %rax') end
 end
 
+local function atomic_register(size: integer, register: string): string
+  if size == 1 then
+    if register == '%rax' then return '%al' end
+    if register == '%rcx' then return '%cl' end
+    if register == '%r10' then return '%r10b' end
+    return '%r11b'
+  elseif size == 2 then
+    if register == '%rax' then return '%ax' end
+    if register == '%rcx' then return '%cx' end
+    if register == '%r10' then return '%r10w' end
+    return '%r11w'
+  elseif size == 4 then
+    if register == '%rax' then return '%eax' end
+    if register == '%rcx' then return '%ecx' end
+    if register == '%r10' then return '%r10d' end
+    return '%r11d'
+  end
+  return register
+end
+
+local function atomic_suffix(size: integer): string
+  if size == 1 then return 'b' end
+  if size == 2 then return 'w' end
+  if size == 4 then return 'l' end
+  return 'q'
+end
+
+local function atomic_kind(pointer: Id): Id
+  if not ct.is_pointer(pointer) then fail('atomic operation requires a pointer') end
+  local kind = ct.element(pointer)
+  if kind == Kind.Bool then fail('atomic _Bool operands are not supported') end
+  if not ct.is_integer(kind) and not ct.is_pointer(kind) then
+    fail('atomic operation requires an integer or pointer type')
+  end
+  local size = ct.size(kind)
+  if size ~= 1 and size ~= 2 and size ~= 4 and size ~= 8 then
+    fail('unsupported atomic operand size')
+  end
+  return kind
+end
+
+local function atomic_value(value: Id, kind: Id)
+  if not ct.is_integer(value) and not ct.is_pointer(value) then
+    fail('atomic value must be an integer or pointer')
+  end
+  if ct.is_pointer(kind) then
+    if not ct.is_pointer(value) and not ct.is_integer(value) then
+      fail('atomic pointer value requires a pointer or integer')
+    elseif ct.is_pointer(value) and not compatible_pointer(kind, value) then
+      fail('incompatible atomic pointer value')
+    end
+  elseif not ct.is_integer(value) then
+    fail('atomic integer value requires an integer')
+  end
+end
+
+local function atomic_builtin(name: string): Expr
+  local arguments: sequence(Id)
+  if not take(')') then
+    repeat
+      arguments:push(value(expression(2)).kind)
+      push_result()
+    until not take(',')
+    expect(')')
+  end
+  local arity: integer
+  if name == '__atomic_load_n' then arity = 2
+  elseif name == '__atomic_store_n' or name == '__atomic_exchange_n' or
+         name == '__atomic_fetch_add' or name == '__atomic_add_fetch' or
+         name == '__atomic_sub_fetch' then arity = 3
+  else arity = 6 end
+  if #arguments ~= arity then fail('wrong number of arguments for ' .. name) end
+
+  local pointer = arguments[1]
+  local kind = atomic_kind(pointer)
+  if name == '__atomic_load_n' and not ct.is_integer(arguments[2]) then
+    fail('atomic memory order must be an integer')
+  elseif name == '__atomic_store_n' or name == '__atomic_exchange_n' or
+         name == '__atomic_fetch_add' or name == '__atomic_add_fetch' or
+         name == '__atomic_sub_fetch' then
+    if not ct.is_integer(arguments[3]) then fail('atomic memory order must be an integer') end
+  elseif name == '__atomic_compare_exchange_n' then
+    if not ct.is_integer(arguments[4]) or not ct.is_integer(arguments[5]) or
+       not ct.is_integer(arguments[6]) then fail('atomic memory order and weak flag must be integers') end
+  end
+  local size = ct.size(kind)
+  local suffix = atomic_suffix(size)
+  if name == '__atomic_load_n' then
+    pop_result('%rcx') -- memory order
+    pop_result('%r10') -- object pointer
+    load_memory(kind, '(%r10)')
+    return {kind=kind}
+  elseif name == '__atomic_store_n' then
+    atomic_value(arguments[2], kind)
+    pop_result('%rcx') -- memory order
+    pop_result('%r11') -- stored value
+    pop_result('%r10') -- object pointer
+    emit('xchg' .. suffix .. ' ' .. atomic_register(size, '%r11') .. ', (%r10)')
+    return {kind=Kind.Void}
+  elseif name == '__atomic_exchange_n' then
+    atomic_value(arguments[2], kind)
+    pop_result('%rcx') -- memory order
+    pop_result('%r11') -- replacement value
+    pop_result('%r10') -- object pointer
+    emit('xchg' .. suffix .. ' ' .. atomic_register(size, '%r11') .. ', (%r10)')
+    emit('movq %r11, %rax')
+    normalize(kind)
+    return {kind=kind}
+  elseif name == '__atomic_fetch_add' or name == '__atomic_add_fetch' or
+         name == '__atomic_sub_fetch' then
+    if ct.is_pointer(kind) then fail('atomic pointer arithmetic is not supported') end
+    atomic_value(arguments[2], kind)
+    pop_result('%rcx') -- memory order
+    pop_result('%r11') -- arithmetic value
+    pop_result('%r10') -- object pointer
+    local operand = atomic_register(size, '%r11')
+    local saved = atomic_register(size, '%rcx')
+    if name == '__atomic_sub_fetch' then emit('neg' .. suffix .. ' ' .. operand) end
+    if name ~= '__atomic_fetch_add' then emit('mov' .. suffix .. ' ' .. operand .. ', ' .. saved) end
+    emit('lock xadd' .. suffix .. ' ' .. operand .. ', (%r10)')
+    if name ~= '__atomic_fetch_add' then emit('add' .. suffix .. ' ' .. saved .. ', ' .. operand) end
+    emit('movq %r11, %rax')
+    normalize(kind)
+    return {kind=kind}
+  else -- __atomic_compare_exchange_n
+    if not ct.is_pointer(arguments[2]) or not compatible_pointer(arguments[2], pointer) then
+      fail('atomic compare-exchange operand type mismatch')
+    end
+    atomic_value(arguments[3], kind)
+    local done = label()
+    pop_result('%rcx') -- failure order
+    pop_result('%r8') -- success order
+    pop_result('%r9') -- weak flag. Strong CAS also implements weak CAS.
+    pop_result('%r11') -- desired value
+    pop_result('%rdx') -- expected value pointer
+    pop_result('%r10') -- object pointer
+    load_memory(kind, '(%rdx)')
+    emit('lock cmpxchg' .. suffix .. ' ' .. atomic_register(size, '%r11') .. ', (%r10)')
+    emit('setz %r11b')
+    emit('jz ' .. done)
+    store_memory(kind, '(%rdx)')
+    emit(done .. ':')
+    emit('movzbq %r11b, %rax')
+    return {kind=Kind.Bool}
+  end
+end
+
 local function call(target: Expr): Expr
+  if target.symbol == '__atomic_load_n' or target.symbol == '__atomic_store_n' or
+     target.symbol == '__atomic_exchange_n' or target.symbol == '__atomic_fetch_add' or
+     target.symbol == '__atomic_add_fetch' or target.symbol == '__atomic_sub_fetch' or
+     target.symbol == '__atomic_compare_exchange_n' then
+    return atomic_builtin(target.symbol)
+  end
   local fn=target.kind
   local direct=#target.symbol > 0 and ct.is_function(fn)
   if not direct then
@@ -831,6 +984,11 @@ local function resolve(name: string): Expr
     elseif enumerators:has(name) then
       local n=enumerators[name]; immediate(n)
       return {kind=Kind.Int,null_constant=n == 0}
+    elseif name == '__atomic_load_n' or name == '__atomic_store_n' or
+           name == '__atomic_exchange_n' or name == '__atomic_fetch_add' or
+           name == '__atomic_add_fetch' or name == '__atomic_sub_fetch' or
+           name == '__atomic_compare_exchange_n' then
+      return {symbol=name}
     else fail('undeclared local ' .. name) end
   end
   local place=v.slot ~= 0 and address(v.slot) or (v.symbol .. '(%rip)')

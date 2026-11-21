@@ -208,7 +208,7 @@ if native_driver then
       'iconv_standalone.nelua', 'inet.nelua', 'ipc_adapter.c', 'locale_standalone.nelua', 'math_core.nelua', 'memory.nelua',
       'mqueue_adapter.c', 'pwd_standalone.nelua', 'regex_standalone.nelua',
       'search_standalone.nelua', 'spawn_standalone.nelua',
-      'stdio.nelua', 'stdio_startup_stub.c', 'stdio_varargs.c', 'stdlib_float.nelua',
+      'stdio.nelua', 'stdio_lock_standalone.c', 'credential_adapter.c', 'stdio_startup_stub.c', 'stdio_varargs.c', 'stdlib_float.nelua',
       'string.nelua', 'termios_standalone.nelua', 'thread.nelua', 'unistd.nelua',
       'wordexp_standalone.nelua'}) do
     native_objects[name] = true
@@ -229,7 +229,8 @@ for object, name in units:gmatch('(%S+)%s+(%S+)') do
       command({necc, '--release', '--emit-c', source, '-o', generated}))
     source = generated
   end
-  if bootstrap[name] or name:match('%.S$') then
+  local rebuild_stage_uses_necc = native_driver and native_objects[name]
+  if (bootstrap[name] and not rebuild_stage_uses_necc) or name:match('%.S$') then
     local args = {gcc, '-m64', '-O2', '-fno-pie', '-ffreestanding', '-fno-builtin', '-fno-stack-protector',
       '-fno-tree-loop-distribute-patterns', '-ftls-model=local-exec', '-nostdinc', '-DNELIBC_STANDALONE',
       '-I' .. tree .. '/include', '-isystem', builtin, '-isystem', sdk .. '/uapi'}

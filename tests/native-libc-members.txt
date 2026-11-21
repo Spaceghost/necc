@@ -1,6 +1,7 @@
 alloc
 alloc-exports
 crypt
+credentials
 ctype
 exit
 extras
@@ -20,6 +21,7 @@ semaphore
 slocale
 spawn
 stdio
+stdio-lock
 stdio-startup
 stdio-varargs
 strfloat
