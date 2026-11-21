@@ -167,17 +167,20 @@ Each archive member fits the staged archiver's 15-byte name limit. Two clean
 builds in separate output directories with the same source and tools produce
 identical archives.
 
-To build the archiver and linker from source, point `NELINKER_SRC` at a
-nelinker checkout with archive creation support. From an empty output
-directory, the following graph builds `libc/nelinker` against the seed SDK,
-uses it to write the indexed 47-member archive, and uses it again to link
-the Lua runtime against the new archive. The seed SDK must be on an absolute
-path. Each relative tool or output name is relative to the build directory.
+To build more of Nelibc with necc, pass the nelinker and necc source
+directories after the output prefix. From an empty build directory, the
+graph below builds both tools against the seed SDK. The new C frontend
+also compiles the allocator, crypt, floating-point environment, inet,
+regex, spawn, termios, pthread and wordexp modules. This brings the native
+total to 17 of 47 objects. TinyCC compiles 19 and GCC supplies eleven.
+The staged nelinker writes the indexed archive and links the Lua runtime.
+The seed SDK must be on an absolute path. Relative tool and output names
+are relative to the build directory.
 
 ```sh
 {
   "$NECC" --lua "$NECC_SRC/render-libc.lua" "$NECC" "$NECC_SYSROOT" \
-    "$NELIBC_SRC" "$(command -v gcc)" libc "$NELINKER_SRC"
+    "$NELIBC_SRC" "$(command -v gcc)" libc "$NELINKER_SRC" "$NECC_SRC"
   NECC_NELINKER=libc/nelinker "$NECC" --lua "$NECC_SRC/render-lua.lua" "$NECC" "$NECC_SYSROOT" \
     "$NELUA_SRC" runtime libc/libnelibc.a
   printf 'default runtime/nelua-lua\n'
@@ -185,6 +188,9 @@ path. Each relative tool or output name is relative to the build directory.
 "$NEBUILD" -j 4 build.ne
 runtime/nelua-lua -e 'print(_VERSION)'
 ```
+
+Passing just the nelinker directory uses the native archive and runtime
+linker with the eight-object profile of the seed compiler.
 
 To exercise the linker selection and warm rebuild with the same sources and
 SDK, run the focused runtime check from that directory.

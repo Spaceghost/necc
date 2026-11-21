@@ -1,6 +1,7 @@
 -- Generate the standalone x86-64 Nelibc archive from its original sources.
 local lfs = require 'lfs'
-assert(#arg >= 4 and #arg <= 6, 'usage: render-libc.lua NECC SYSROOT NELIBC_SRC X86_64_GCC [OUTPUT_PREFIX [NELINKER_SRC]]')
+assert(#arg >= 4 and #arg <= 7, 'usage: render-libc.lua NECC SYSROOT NELIBC_SRC X86_64_GCC [OUTPUT_PREFIX [NELINKER_SRC [NECC_SOURCE]]]')
+assert(not arg[7] or arg[6], 'NECC_SOURCE requires NELINKER_SRC')
 
 local function absolute(path)
   if path:sub(1, 1) ~= '/' then path = lfs.currentdir() .. '/' .. path end
@@ -32,11 +33,18 @@ local function files(dir, pattern, list)
 end
 
 local prefix = arg[5] and arg[5]:gsub('/+$', '') or ''
-assert(not arg[5] or (prefix ~= '' and prefix:sub(1, 1) ~= '/' and not prefix:find('%s')),
+assert(not arg[5] or ((prefix == '' and arg[6]) or
+    (prefix ~= '' and prefix:sub(1, 1) ~= '/' and not prefix:find('%s'))),
   'output prefix must be a relative path without whitespace')
+assert(not arg[5] or prefix ~= '' or arg[5] == '',
+  'an empty output prefix must be written as an empty argument')
 
 local function output(name)
   return prefix == '' and name or prefix .. '/' .. name
+end
+
+local function executable(name)
+  return prefix == '' and './' .. name or prefix .. '/' .. name
 end
 
 local function edge(target, inputs, recipe)
@@ -55,6 +63,10 @@ local function edge(target, inputs, recipe)
 end
 
 local necc, sdk, tree, gcc = absolute(arg[1]), absolute(arg[2]), absolute(arg[3]), absolute(arg[4])
+local necc_source = arg[7] and absolute(arg[7])
+assert(not necc_source or (lfs.attributes(necc_source, 'mode') == 'directory' and
+    lfs.attributes(necc_source .. '/necc.nelua', 'mode') == 'file'),
+  'NECC_SOURCE must be the source directory containing necc.nelua')
 local tcc = sdk .. '/tcc/tcc'
 local src = tree .. '/src'
 local pipe = assert(io.popen(command({gcc, '-print-file-name=include'}), 'r'))
@@ -90,6 +102,26 @@ if arg[6] then
   edge(archiver, {sources, nelua_frontend, target_headers, {sdk .. '/libnelibc.a', sdk .. '/tcc/libtcc1.a'}},
     'NECC_NELINKER= NECC_SYSROOT=' .. quote(sdk) .. ' ' ..
     command({necc, '--release', '-L', dir, dir .. '/nelinker.nelua', '-o', archiver}))
+end
+
+-- This opt-in bootstrap compiles the supplied full necc source with the
+-- released driver and seed SDK. The resulting driver handles native C codegen
+-- for the broader allowlist below; its own link still uses the seed TCC.
+local native_driver
+if necc_source then
+  local source_dir = necc_source
+  local modules = {}
+  for name in lfs.dir(source_dir) do
+    if name:match('%.nelua$') then modules[#modules + 1] = source_dir .. '/' .. name end
+  end
+  table.sort(modules)
+  native_driver = output('necc')
+  local native_driver_command = executable('necc')
+  local inputs = {modules, nelua_frontend, target_headers,
+    {necc, sdk .. '/nelua-lua', sdk .. '/libnelibc.a', tcc, sdk .. '/tcc/libtcc1.a'}}
+  edge(native_driver, inputs, 'NECC_SYSROOT=' .. quote(sdk) .. ' NECC_NELINKER= ' ..
+    command({necc, '--release', '-L', source_dir, source_dir .. '/necc.nelua', '-o', native_driver}))
+  native_driver = {target=native_driver, command=native_driver_command}
 end
 
 -- Keep the standalone TinyCC profile's archive order. Compiler runtime
@@ -166,6 +198,14 @@ local native_objects = {
   ['semaphore_adapter.c'] = true,
   ['syscall_adapter.c'] = true,
 }
+if native_driver then
+  for _, name in ipairs({
+      'alloc.nelua', 'crypt_standalone.nelua', 'fenv_standalone.nelua', 'inet.nelua',
+      'regex_standalone.nelua', 'spawn_standalone.nelua', 'termios_standalone.nelua',
+      'thread.nelua', 'wordexp_standalone.nelua'}) do
+    native_objects[name] = true
+  end
+end
 
 local objects, members = {}, {}
 for object, name in units:gmatch('(%S+)%s+(%S+)') do
@@ -189,12 +229,14 @@ for object, name in units:gmatch('(%S+)%s+(%S+)') do
     for _, word in ipairs({'-c', source, '-o', output(object)}) do args[#args + 1] = word end
     edge(output(object), {{source, gcc}, target_headers, compiler_headers}, command(args))
   elseif native_objects[name] then
-    local args = {necc, '-c', '-DNELIBC_STANDALONE'}
+    local compiler_target = native_driver and native_driver.target or necc
+    local compiler = native_driver and native_driver.command or necc
+    local args = {compiler, '-c', '-DNELIBC_STANDALONE'}
     for _, dir in ipairs({tree .. '/include', sdk .. '/include', sdk .. '/tcc/include', sdk .. '/uapi'}) do
       args[#args + 1] = '-I' .. dir
     end
     for _, word in ipairs({source, '-o', output(object)}) do args[#args + 1] = word end
-    edge(output(object), {{source, necc, tcc}, target_headers}, 'NECC_SYSROOT=' .. quote(sdk) .. ' ' .. command(args))
+    edge(output(object), {{source, compiler_target, tcc}, target_headers}, 'NECC_SYSROOT=' .. quote(sdk) .. ' ' .. command(args))
   else
     local args = {tcc, '-B' .. sdk .. '/tcc', '-std=c11', '-ffreestanding', '-nostdinc', '-DNELIBC_STANDALONE',
       '-I' .. tree .. '/include', '-I' .. sdk .. '/include', '-I' .. sdk .. '/tcc/include', '-I' .. sdk .. '/uapi',
@@ -206,7 +248,7 @@ end
 
 local archive = output('libnelibc.a')
 if archiver then
-  edge(archive, {{archiver}, objects}, command({archiver, '--archive', '-o', archive, table.unpack(objects)}))
+  edge(archive, {{archiver}, objects}, command({executable('nelinker'), '--archive', '-o', archive, table.unpack(objects)}))
 else
   edge(archive, {{tcc}, objects}, command({tcc, '-ar', 'rcs', archive, table.unpack(objects)}))
 end
