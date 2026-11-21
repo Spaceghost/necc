@@ -1,6 +1,6 @@
 -- Generate the standalone x86-64 Nelibc archive from its original sources.
 local lfs = require 'lfs'
-assert(#arg == 4 or #arg == 5, 'usage: render-libc.lua NECC SYSROOT NELIBC_SRC X86_64_GCC [OUTPUT_PREFIX]')
+assert(#arg >= 4 and #arg <= 6, 'usage: render-libc.lua NECC SYSROOT NELIBC_SRC X86_64_GCC [OUTPUT_PREFIX [NELINKER_SRC]]')
 
 local function absolute(path)
   if path:sub(1, 1) ~= '/' then path = lfs.currentdir() .. '/' .. path end
@@ -80,6 +80,18 @@ local target_headers = stamp(output('target-headers.stamp'), headers)
 local compiler_headers = stamp(output('gcc-headers.stamp'), gcc_headers)
 local nelua_frontend = stamp(output('nelua-frontend.stamp'), frontend)
 
+-- Build the archive writer with the seed libc, before the new libc exists.
+local archiver
+if arg[6] then
+  local dir = absolute(arg[6]) .. '/src'
+  local sources = {}
+  files(dir, '%.nelua$', sources)
+  archiver = output('nelinker')
+  edge(archiver, {sources, nelua_frontend, target_headers, {sdk .. '/libnelibc.a', sdk .. '/tcc/libtcc1.a'}},
+    'NECC_NELINKER= NECC_SYSROOT=' .. quote(sdk) .. ' ' ..
+    command({necc, '--release', '-L', dir, dir .. '/nelinker.nelua', '-o', archiver}))
+end
+
 -- Keep the standalone TinyCC profile's archive order. Compiler runtime
 -- routines come from the SDK's separate libtcc1.a at executable link time.
 -- TinyCC's ar stores 15-byte names. Short, unique member names also let
@@ -141,6 +153,20 @@ for name in ([[
 errno/standalone.nelua stdlib.nelua environment_adapter.c credential_adapter.c stdio_lock_standalone.c complex_abi.c
 ]]):gmatch('%S+') do bootstrap[name] = true end
 
+-- These C adapters and generated Nelua modules fit necc's native C frontend
+-- and have passed the standalone archive consumers. Keep the rest on TinyCC
+-- until its frontend checks cover their constructs.
+local native_objects = {
+  ['string_locale_standalone.nelua'] = true,
+  ['stdlib_exit_standalone.nelua'] = true,
+  ['extras_standalone.nelua'] = true,
+  ['sys/linux_x86_64.nelua'] = true,
+  ['sys/linux_x86_64_ops.c'] = true,
+  ['fcntl_adapter.c'] = true,
+  ['semaphore_adapter.c'] = true,
+  ['syscall_adapter.c'] = true,
+}
+
 local objects, members = {}, {}
 for object, name in units:gmatch('(%S+)%s+(%S+)') do
   assert(#object <= 15 and not members[object], 'invalid or repeated archive member ' .. object)
@@ -162,6 +188,13 @@ for object, name in units:gmatch('(%S+)%s+(%S+)') do
     if name == 'memory_x86_64.S' then args[#args + 1] = '-DNELIBC_TCC_PUBLIC_MEMCPY' end
     for _, word in ipairs({'-c', source, '-o', output(object)}) do args[#args + 1] = word end
     edge(output(object), {{source, gcc}, target_headers, compiler_headers}, command(args))
+  elseif native_objects[name] then
+    local args = {necc, '-c', '-DNELIBC_STANDALONE'}
+    for _, dir in ipairs({tree .. '/include', sdk .. '/include', sdk .. '/tcc/include', sdk .. '/uapi'}) do
+      args[#args + 1] = '-I' .. dir
+    end
+    for _, word in ipairs({source, '-o', output(object)}) do args[#args + 1] = word end
+    edge(output(object), {{source, necc, tcc}, target_headers}, 'NECC_SYSROOT=' .. quote(sdk) .. ' ' .. command(args))
   else
     local args = {tcc, '-B' .. sdk .. '/tcc', '-std=c11', '-ffreestanding', '-nostdinc', '-DNELIBC_STANDALONE',
       '-I' .. tree .. '/include', '-I' .. sdk .. '/include', '-I' .. sdk .. '/tcc/include', '-I' .. sdk .. '/uapi',
@@ -172,5 +205,9 @@ for object, name in units:gmatch('(%S+)%s+(%S+)') do
 end
 
 local archive = output('libnelibc.a')
-edge(archive, {{tcc}, objects}, command({tcc, '-ar', 'rcs', archive, table.unpack(objects)}))
+if archiver then
+  edge(archive, {{archiver}, objects}, command({archiver, '--archive', '-o', archive, table.unpack(objects)}))
+else
+  edge(archive, {{tcc}, objects}, command({tcc, '-ar', 'rcs', archive, table.unpack(objects)}))
+end
 if prefix == '' then print('default ' .. archive) end

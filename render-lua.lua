@@ -17,6 +17,12 @@ end
 local archive_override = arg[5]
 local src = tree .. '/src'
 local tcc = sdk .. '/tcc/tcc'
+local native_linker_input = os.getenv('NECC_NELINKER') or ''
+local native_linker
+if #native_linker_input > 0 then
+  assert(not native_linker_input:find('%s'), 'NECC_NELINKER paths cannot contain whitespace')
+  native_linker = absolute(native_linker_input)
+end
 local flags = {'-B' .. sdk .. '/tcc', '-std=gnu99', '-nostdinc', '-DNELIBC_STANDALONE',
   '-DNDEBUG', '-DLUA_USE_POSIX', '-DMAXRECLEVEL=400', '-I' .. sdk .. '/include',
   '-I' .. sdk .. '/tcc/include', '-I' .. sdk .. '/uapi', '-I' .. src .. '/lua'}
@@ -83,14 +89,29 @@ for _, unit in ipairs(units) do
 end
 local archive, support = archive_override or sdk .. '/libnelibc.a', sdk .. '/tcc/libtcc1.a'
 local runtime = output('nelua-lua')
-local deps = {tcc, archive, support, table.unpack(objects)}
-if archive_override then
+local deps = {archive, support, table.unpack(objects)}
+if native_linker then
+  -- Capture the selected executable while rendering the graph. necc normally
+  -- reads NECC_NELINKER at link time, when that environment could have changed.
+  deps[#deps + 1] = native_linker_input
+  local args = {native_linker, '--tcc-relocs', '-e', '_start'}
+  for _, obj in ipairs(objects) do args[#args + 1] = obj end
+  for _, word in ipairs({'--whole-archive', archive, '--no-whole-archive', support}) do
+    args[#args + 1] = word
+  end
+  args[#args + 1] = '-o'
+  args[#args + 1] = runtime
+  edge(runtime, deps, command(args))
+elseif archive_override then
+  deps[#deps + 1] = tcc
   local args = {tcc, '-B' .. sdk .. '/tcc', '-nostdlib', '-static', '-Wl,-e,_start', '-o', runtime}
   for _, obj in ipairs(objects) do args[#args + 1] = obj end
   for _, word in ipairs({'-Wl,--whole-archive', archive, '-Wl,--no-whole-archive', support}) do args[#args + 1] = word end
   edge(runtime, deps, command(args))
 else
+  deps[#deps + 1] = tcc
   deps[#deps + 1] = necc
-  edge(runtime, deps, 'NECC_SYSROOT=' .. quote(sdk) .. ' ' .. command({necc, '-o', runtime, table.unpack(objects)}))
+  edge(runtime, deps, 'NECC_SYSROOT=' .. quote(sdk) .. ' NECC_NELINKER= ' ..
+    command({necc, '-o', runtime, table.unpack(objects)}))
 end
 if prefix == '' then print('default ' .. runtime) end

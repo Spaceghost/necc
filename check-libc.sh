@@ -11,6 +11,7 @@ tree=$(absolute "$3")
 gcc=$(absolute "$4")
 archive=$(absolute "$5")
 scratch=$(absolute "$6")
+script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd)
 mkdir -p "$scratch"
 work=$(mktemp -d "$scratch/necc-libc.XXXXXXXX")
 cd "$work"
@@ -26,9 +27,9 @@ compile() {
     "$gcc" -m64 -O2 -fno-pie -fno-stack-protector -ffreestanding -fno-builtin -ftls-model=local-exec \
         -nostdinc -DNELIBC_STANDALONE -I"$tree/include" -isystem "$builtin" -isystem "$sdk/uapi" -c "$1" -o "$2"
 }
-check() {
-    name=$1; shift
-    compile "$tree/tools/$name.c" "$name.o"
+check_source() {
+    name=$1 source=$2; shift 2
+    compile "$source" "$name.o"
     "$cc" "$name.o" "$@" -o "$name"
     readelf -lW "$name" > "$name.segments"
     readelf -dW "$name" > "$name.dynamic"
@@ -39,7 +40,14 @@ check() {
     "./$name"
     printf '%s passed\n' "$name"
 }
+check() {
+    name=$1; shift
+    check_source "$name" "$tree/tools/$name.c" "$@"
+}
 check lib_consumer_smoke
+printf 'shutdown\nexit_atexit_smoke passed\n' > exit_atexit_smoke.expected
+check_source exit_atexit_smoke "$script_dir/tests/exit_atexit_smoke.c" > exit_atexit_smoke.actual
+cmp exit_atexit_smoke.expected exit_atexit_smoke.actual
 # GNU ld and the staged linker must use the same address for the x86-64
 # allocator lock. A misplaced release store leaves the next malloc spinning.
 "$gcc" -fuse-ld=bfd -nostdlib -static -no-pie -Wl,-e,_start -Wl,-z,noexecstack lib_consumer_smoke.o \

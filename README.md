@@ -117,9 +117,11 @@ From an empty output directory, generate the dependency graph and run it:
 Every original translation unit in the bundled Lua 5.4.6 runtime and Nelua C
 extensions goes through the native C frontend. The release configuration has
 42 translation units, including one empty debug-print unit. TinyCC supplies
-dependency discovery, preprocessing, assembly and the static link with
-Nelibc. nebuild follows header dependencies and skips all recipes on a second
-build with the same inputs. The single-translation-unit TinyCC seed recipe is
+dependency discovery, preprocessing and assembly. To link the runtime with
+nelinker, set `NECC_NELINKER` when generating the graph. The graph records
+that executable as a link dependency. Leaving the variable empty selects the
+TinyCC bootstrap link. nebuild follows header dependencies and skips all
+recipes on a second build with the same inputs. The single-translation-unit TinyCC seed recipe is
 available through `build-lua.sh`.
 
 The table check compares all 83 opcode modes and all 257 character entries with
@@ -143,8 +145,11 @@ export NECC_SYSROOT="$SDK"
 "$NECC_SRC/check-libc.sh" "$NECC" "$SDK" "$NELIBC_SRC" "$(command -v gcc)" "$PWD/libnelibc.a" "$SCRATCH"
 ```
 
-The graph builds all 47 archive members from source. The staged toolchain
-compiles 36. An x86-64 Linux GCC supplies the remaining eleven object files for
+The graph builds all 47 archive members from source. The native necc backend
+compiles the syscall table, fcntl, semaphore and syscall adapters, plus the
+exit, standalone extras, string locale and Linux syscall modules. TinyCC
+preprocesses and assembles those eight objects and compiles 28 others.
+An x86-64 Linux GCC supplies the remaining eleven object files for
 local-exec TLS, atomic operations, the complex calling convention, and
 assembly. For the two Nelua modules with thread-local storage, necc emits C
 and GCC compiles it. The build uses Nelibc's headers, the staged Linux
@@ -162,17 +167,29 @@ Each archive member fits the staged archiver's 15-byte name limit. Two clean
 builds in separate output directories with the same source and tools produce
 identical archives.
 
-To compose the libc and runtime graphs, give each renderer a relative output
-prefix. The runtime link can then take the rebuilt archive as a graph input.
-Run this from an output directory with `NECC_SYSROOT` set to the seed SDK.
+To build the archiver and linker from source, point `NELINKER_SRC` at a
+nelinker checkout with archive creation support. From an empty output
+directory, the following graph builds `libc/nelinker` against the seed SDK,
+uses it to write the indexed 47-member archive, and uses it again to link
+the Lua runtime against the new archive. The seed SDK must be on an absolute
+path. Each relative tool or output name is relative to the build directory.
 
 ```sh
 {
   "$NECC" --lua "$NECC_SRC/render-libc.lua" "$NECC" "$NECC_SYSROOT" \
-    "$NELIBC_SRC" "$(command -v gcc)" libc
-  "$NECC" --lua "$NECC_SRC/render-lua.lua" "$NECC" "$NECC_SYSROOT" \
+    "$NELIBC_SRC" "$(command -v gcc)" libc "$NELINKER_SRC"
+  NECC_NELINKER=libc/nelinker "$NECC" --lua "$NECC_SRC/render-lua.lua" "$NECC" "$NECC_SYSROOT" \
     "$NELUA_SRC" runtime libc/libnelibc.a
   printf 'default runtime/nelua-lua\n'
 } > build.ne
 "$NEBUILD" -j 4 build.ne
+runtime/nelua-lua -e 'print(_VERSION)'
+```
+
+To exercise the linker selection and warm rebuild with the same sources and
+SDK, run the focused runtime check from that directory.
+
+```sh
+"$NECC_SRC/check-render-lua-linker.sh" "$NECC" "$NEBUILD" "$NECC_SYSROOT" \
+  "$NELUA_SRC" "$PWD/libc/nelinker" "$PWD"
 ```
