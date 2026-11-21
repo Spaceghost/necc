@@ -50,25 +50,31 @@ fi
 
 cat > empty-values.c <<'C'
 struct Empty {};
+struct Sequence { void *impl; struct Empty allocator; };
 static int effects;
 static struct Empty empty_value(int amount) {
     effects += amount;
     return (struct Empty){};
 }
-static int consume(struct Empty ignored, int value) { return value; }
+static int sequence_push(struct Sequence *self, struct Empty ignored, int value) {
+    return self != 0 ? value : 0;
+}
 static struct Empty global_empty = {};
 int main(void) {
+    struct Sequence sequence = {0};
     struct Empty local = {};
     struct Empty *address = &local;
     local = empty_value(2);
     if (effects != 2 || address != &local) return 1;
-    if (consume(empty_value(3), 42) != 42 || effects != 5) return 2;
+    if (sequence_push(&sequence, empty_value(3), 42) != 42 || effects != 5) return 2;
     return sizeof(global_empty) != 0;
 }
 C
 "$necc" -c empty-values.c -o empty-values.o
-"$cc" -no-pie empty-values.o -o empty-values
-./empty-values
+"$cc" -std=gnu11 -O2 -o empty-values-gcc empty-values.c
+"$cc" -no-pie empty-values.o -o empty-values-necc
+./empty-values-gcc
+./empty-values-necc
 
 cat > shared.h <<'C'
 #include <stdarg.h>
