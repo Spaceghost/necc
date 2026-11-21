@@ -1578,7 +1578,10 @@ local function global_init(k: Id, out: *sequence(string)): Id
     local words=read_constant()
     if ct.is_pointer(k) then
       local symbol,source_type=address_constant(&words,1,#words)
-      if symbol ~= '0' and not compatible_pointer(source_type,k) then fail('incompatible pointer initializer') end
+      if symbol ~= '0' and not compatible_pointer(source_type,k) then
+        if ct.is_function(ct.element(source_type)) then fail('incompatible function pointer') end
+        fail('incompatible pointer initializer')
+      end
       out:push('  .quad ' .. symbol)
     elseif ct.floating(k) or ct.long_double(k) then
       local bits,significand,sign_exponent = floating_initializer(&words, k)
