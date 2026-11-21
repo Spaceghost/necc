@@ -35,6 +35,16 @@ check_c() {
 "$necc" '-Iuser headers' -D INC=2 'hello world.c' -o one
 check_c ./one
 "$necc" -I 'user headers' -DINC=2 -E 'hello world.c' -o pp.i
+# Building the SDK preprocessor with unlocked output must leave target
+# programs' calls to the standard, locking fputs symbol intact.
+cat > write.c <<'C'
+#include <stdio.h>
+int write_message(const char *message, FILE *stream) {
+    return fputs(message, stream);
+}
+C
+"$necc" -c write.c -o write.o
+nm -u write.o | grep -Eq '[[:space:]]U fputs$'
 "$necc" -S pp.i -o output.s
 grep -q 'Lnecc_' output.s
 "$necc" -c output.s -o output.o
