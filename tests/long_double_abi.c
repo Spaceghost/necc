@@ -1,3 +1,5 @@
+static long double necc_long_double_global = 1.0000000000000000001L;
+
 long double necc_long_double_make(long long value) {
   return (long double)value;
 }
@@ -36,6 +38,15 @@ long double necc_long_double_literal(void) {
   return 1.0000000000000000001L;
 }
 
+long double necc_long_double_global_value(void) {
+  return necc_long_double_global;
+}
+
+long double necc_long_double_local_roundtrip(long double value) {
+  long double local = value;
+  return local;
+}
+
 double necc_long_double_to_double(long double value) {
   return (double)value;
 }
@@ -66,9 +77,42 @@ long double necc_long_double_vararg(int marker, ...) {
   return value;
 }
 
+long double necc_long_double_vararg_after_stack(unsigned long a, unsigned long b,
+                                                 unsigned long c, unsigned long d,
+                                                 unsigned long e, unsigned long f,
+                                                 unsigned long g, ...) {
+  va_list arguments;
+  __builtin_va_start(arguments, g);
+  long double value = __builtin_va_arg(arguments, long double);
+  __builtin_va_end(arguments);
+  return value + (long double)(a + b + c + d + e + f + g);
+}
+
 long double necc_long_double_after_six_gp(int a, int b, int c, int d, int e, int f,
                                           long double value) {
   return value + (long double)(a + b + c + d + e + f);
+}
+
+
+extern long double gcc_long_double_many_args(unsigned long, unsigned long, unsigned long,
+                                              unsigned long, unsigned long, unsigned long,
+                                              unsigned long, long double, int);
+
+long double necc_long_double_call_gcc_many_args(void) {
+  return gcc_long_double_many_args(1, 2, 3, 4, 5, 6, 7, 0.5L, 9);
+}
+
+long double necc_long_double_many_args(unsigned long a, unsigned long b, unsigned long c,
+                                        unsigned long d, unsigned long e, unsigned long f,
+                                        unsigned long g, long double value, int tail) {
+  return value + (long double)(a + b + c + d + e + f + g + tail);
+}
+
+extern int gcc_long_double_mutate(long double *);
+extern long double gcc_long_double_capture(long double, int);
+
+long double necc_long_double_snapshot(long double *value) {
+  return gcc_long_double_capture(*value, gcc_long_double_mutate(value));
 }
 
 static long double from_integer = 3 * 7;

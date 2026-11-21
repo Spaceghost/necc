@@ -569,7 +569,7 @@ local function zero_local(k: Id, slot: integer)
   if off < size then emit('movb $0, ' .. address(slot-off)) end
 end
 
-local Placement = @record{kind: Id, reg: integer}
+local Placement = @record{kind: Id, reg: integer, pad_before: integer}
 local Abi = @record{ms: boolean, gp: integer, sse: integer, stack: integer}
 
 -- INTEGER and SSE arguments have independent register sequences in SysV.
@@ -581,8 +581,9 @@ local va_last: string
 local function place(abi: *Abi,k: Id): Placement
   if ct.long_double(k) then
     if abi.ms then fail('unsupported Microsoft x64 long double argument') end
-    abi.stack=abi.stack+2
-    return {kind=k}
+    local padding=abi.stack%2
+    abi.stack=abi.stack+padding+2
+    return {kind=k,pad_before=padding}
   end
   if abi.ms then
     if not scalar(k) then fail('unsupported Microsoft x64 argument type') end
@@ -719,7 +720,12 @@ local function call(target: Expr): Expr
           for i = 0, (@integer)(#args-first)-1 do load_record_piece(k, i); push_result() end
         end
       else
-        convert(e, k, false); args:push(place(&abi, k)); push_result()
+        convert(e, k, false)
+        if ct.long_double(k) then
+          local snapshot=reserve(k)
+          store_memory(k,address(snapshot)); emit('leaq ' .. address(snapshot) .. ', %rax')
+        end
+        args:push(place(&abi, k)); push_result()
       end
     until not take(',')
     expect(')')
@@ -757,6 +763,7 @@ local function call(target: Expr): Expr
       if ct.long_double(args[i].kind) then
         emit('movq ' .. tostring((count-i)*8) .. '(%r10), %rax')
         emit('pushq 8(%rax)'); emit('pushq (%rax)')
+        if args[i].pad_before > 0 then emit('pushq $0') end
       else emit('pushq ' .. tostring((count-i)*8) .. '(%r10)') end
     end
   end
@@ -1942,12 +1949,13 @@ local function compile_function(d: headers.Declaration)
       local a = incoming[j]
       local dest = address(v.slot - (@integer)(j-1)*8)
       if a.reg == 0 then
-        emit('movq ' .. tostring((abi.ms and 48 or 16) + stack*8) .. '(%rbp), %rax')
+        local parameter_offset=stack+a.pad_before
+        emit('movq ' .. tostring((abi.ms and 48 or 16) + parameter_offset*8) .. '(%rbp), %rax')
         emit('movq %rax, ' .. dest)
         if ct.long_double(a.kind) then
-          emit('movq ' .. tostring((abi.ms and 56 or 24) + stack*8) .. '(%rbp), %rax')
+          emit('movq ' .. tostring((abi.ms and 56 or 24) + parameter_offset*8) .. '(%rbp), %rax')
           emit('movq %rax, ' .. address(v.slot-8))
-          stack = stack + 2
+          stack = stack + a.pad_before + 2
         else stack = stack + 1 end
       elseif ct.floating(a.kind) then
         xmm_out(a.kind, '%xmm' .. tostring(a.reg-1)); store_memory(a.kind, dest)
