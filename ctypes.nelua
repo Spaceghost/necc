@@ -54,6 +54,8 @@ function ct.is_complete(t: Id): boolean
 end
 
 function ct.floating(t: Id): boolean return t == K.Float or t == K.Double end
+function ct.sse_floating(t: Id): boolean return t == K.Float or t == K.Double end
+function ct.long_double(t: Id): boolean return t == K.LongDouble end
 
 function ct.unsigned(t: Id): boolean
   return t == K.Bool or t == K.UChar or t == K.UShort or t == K.UInt or t == K.ULong or t == K.ULLong
@@ -80,6 +82,7 @@ function ct.promote(t: Id): Id
 end
 
 function ct.common(a: Id, b: Id): Id
+  if a == K.LongDouble or b == K.LongDouble then return K.LongDouble end
   if a == K.Double or b == K.Double then return K.Double end
   if a == K.Float or b == K.Float then return K.Float end
   a, b = ct.promote(a), ct.promote(b)
@@ -183,7 +186,8 @@ local function classify(t: Id, offset: integer, parts: *[2]Id): boolean
       if not classify(field.kind, offset+field.offset, parts) then return false end
     end
   else
-    if not ct.is_integer(t) and not ct.is_pointer(t) and not ct.floating(t) then return false end
+    if t == K.LongDouble then return false end -- SysV X87/X87UP forces aggregates to MEMORY.
+    if not ct.is_integer(t) and not ct.is_pointer(t) and not ct.sse_floating(t) then return false end
     local index = offset // 8
     if index > 1 or offset % ct.align(t) ~= 0 then return false end
     if not ct.floating(t) then ($parts)[index] = K.ULong

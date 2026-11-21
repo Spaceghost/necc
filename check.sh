@@ -13,6 +13,7 @@ cc=${CC:-cc}
 as=${AS:-as}
 ld=${LD:-ld}
 export TMPDIR=$out TMP=$out TEMP=$out
+repo=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 
 cat > "$out/abi.c" <<'C'
 /* Exercise System V arguments, calls inside expressions,
@@ -187,5 +188,11 @@ reject 'int main(void) { return lost; }' 'undeclared local'
 reject 'int main(void) { while (1) { return 0;' 'expected identifier'
 reject 'int main(void) { missing = 1; }' 'undeclared local'
 reject '/* unterminated' 'unterminated comment'
+
+"$necc" "$repo/tests/long_double_abi.c" -o "$out/long-double-abi.s"
+"$as" --64 "$out/long-double-abi.s" -o "$out/long-double-abi.o"
+"$cc" -std=c11 -O0 -Wall -Wextra -Werror -frounding-math \
+    "$repo/tests/long_double_abi_main.c" "$out/long-double-abi.o" -lm -o "$out/long-double-abi"
+"$out/long-double-abi"
 
 echo "necc ABI, arithmetic and invalid input checks passed in $out"

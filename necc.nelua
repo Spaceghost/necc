@@ -301,6 +301,7 @@ end
 
 local function load_memory(k: Id, place: string)
   local n = ct.size(k)
+  if ct.long_double(k) then emit('leaq ' .. place .. ', %rax'); return end
   if n == 1 then emit((ct.unsigned(k) and 'movzbq ' or 'movsbq ') .. place .. ', %rax')
   elseif n == 2 then emit((ct.unsigned(k) and 'movzwq ' or 'movswq ') .. place .. ', %rax')
   elseif n == 4 then emit((ct.unsigned(k) and 'movl ' or 'movslq ') .. place .. (ct.unsigned(k) and ', %eax' or ', %rax'))
@@ -310,7 +311,10 @@ end
 
 local function store_memory(k: Id, place: string)
   local n = ct.size(k)
-  if n == 1 then emit('movb %al, ' .. place)
+  if ct.long_double(k) then
+    emit('movq %rax, %r11'); emit('movq (%r11), %r10'); emit('movq 8(%r11), %r11')
+    emit('leaq ' .. place .. ', %rdi'); emit('movq %r10, (%rdi)'); emit('movq %r11, 8(%rdi)')
+  elseif n == 1 then emit('movb %al, ' .. place)
   elseif n == 2 then emit('movw %ax, ' .. place)
   elseif n == 4 then emit('movl %eax, ' .. place)
   elseif n == 8 then emit('movq %rax, ' .. place)
@@ -355,9 +359,20 @@ local function string_symbol(bytes: *sequence(byte)): string
   return name
 end
 
+local function long_double_symbol(word: string): string
+  local significand,sign_exponent,k=fp.literal_long_double(word)
+  if k == Kind.Unknown then fail('invalid long double literal') end
+  local name=label()
+  constants:push(name .. ':')
+  constants:push('  .quad ' .. tostring(significand))
+  constants:push('  .short ' .. tostring(sign_exponent))
+  for i=1,6 do constants:push('  .byte 0') end
+  return name
+end
+
 local Expr = @record{kind: Id, lvalue: boolean, readonly: boolean, null_constant: boolean, symbol: string,
                      place: string, mark: usize, literal: boolean, number: integer, cc: string}
-local function scalar(k: Id): boolean return ct.is_integer(k) or ct.is_pointer(k) or ct.floating(k) end
+local function scalar(k: Id): boolean return ct.is_integer(k) or ct.is_pointer(k) or ct.floating(k) or ct.long_double(k) end
 
 -- An lvalue leaves its address in RAX. Load only when the context needs its value.
 local function value(e: Expr): Expr
@@ -368,6 +383,7 @@ local function value(e: Expr): Expr
     return {kind=ct.pointer(ct.element(e.kind))}
   elseif e.lvalue then
     if ct.is_record(e.kind) then return {kind=e.kind} end
+    if ct.long_double(e.kind) then return {kind=e.kind} end -- RAX remains the 16-byte value address.
     if not scalar(e.kind) then fail('unsupported object value') end
     if #e.place>0 and #body==e.mark then
       body:pop()
@@ -398,11 +414,58 @@ local function truth(k: Id)
     xmm_in(k,'%xmm0'); emit('pxor %xmm1, %xmm1')
     emit(sse.compare(k, 1, 0))
     emit('setne %al'); emit('setp %dl'); emit('orb %dl, %al'); emit('movzbl %al, %eax')
+  elseif ct.long_double(k) then
+    emit('fldt (%rax)'); emit('ftst'); emit('fnstsw %ax'); emit('fstp %st(0)'); emit('sahf')
+    emit('setne %al'); emit('setp %dl'); emit('orb %dl, %al'); emit('movzbl %al, %eax')
   else emit('testq %rax, %rax'); emit('setne %al'); emit('movzbl %al, %eax') end
 end
 
 local function numeric_conversion(from: Id,into: Id)
   if from == into then return end
+  if into == Kind.LongDouble then
+    local source=reserve(ct.is_integer(from) and Kind.Long or from)
+    if ct.long_double(from) then emit('fldt (%rax)')
+    elseif ct.floating(from) then
+      store_memory(from,address(source)); emit(from == Kind.Float and 'flds ' .. address(source) or 'fldl ' .. address(source))
+    elseif ct.is_integer(from) then
+      if ct.unsigned(from) and ct.size(from)==8 then
+        local low,done=label(),label()
+        emit('testq %rax, %rax'); emit('jns ' .. low)
+        local two64=reserve(Kind.Double)
+        emit('movq %rax, ' .. address(source)); emit('fildq ' .. address(source))
+        immediate(0x43f0000000000000); emit('movq %rax, ' .. address(two64)); emit('fldl ' .. address(two64))
+        emit('faddp %st, %st(1)'); emit('jmp ' .. done)
+        emit(low .. ':'); emit('movq %rax, ' .. address(source)); emit('fildq ' .. address(source)); emit(done .. ':')
+      else
+        normalize(from); emit('movq %rax, ' .. address(source)); emit('fildq ' .. address(source))
+      end
+    else fail('unsupported conversion to long double') end
+    local result=reserve(Kind.LongDouble); emit('fstpt ' .. address(result)); emit('leaq ' .. address(result) .. ', %rax')
+    return
+  elseif from == Kind.LongDouble then
+    if into == Kind.Float or into == Kind.Double then
+      local result=reserve(into)
+      emit('fldt (%rax)')
+      emit(into == Kind.Float and 'fstps ' .. address(result) or 'fstpl ' .. address(result))
+      load_memory(into,address(result)); return
+    elseif ct.is_integer(into) then
+      emit('movq %rax, %r11')
+      local result=reserve(Kind.Long); local control=reserve(Kind.UShort); local truncation=reserve(Kind.UShort)
+      emit('fnstcw ' .. address(control)); emit('movzwl ' .. address(control) .. ', %eax')
+      emit('orl $0x0c00, %eax'); emit('movw %ax, ' .. address(truncation)); emit('fldcw ' .. address(truncation))
+      if ct.unsigned(into) and ct.size(into)==8 then
+        local threshold=reserve(Kind.Double); local low,done=label(),label()
+        immediate(0x43e0000000000000); emit('movq %rax, ' .. address(threshold))
+        emit('fldl ' .. address(threshold)); emit('fldt (%r11)'); emit('fucomip %st(1), %st'); emit('fstp %st(0)')
+        emit('jb ' .. low)
+        emit('fldl ' .. address(threshold)); emit('fldt (%r11)'); emit('fsubp %st, %st(1)')
+        emit('fistpq ' .. address(result)); emit('btsq $63, ' .. address(result)); emit('jmp ' .. done)
+        emit(low .. ':'); emit('fldt (%r11)'); emit('fistpq ' .. address(result)); emit(done .. ':')
+      else emit('fldt (%r11)'); emit('fistpq ' .. address(result)) end
+      emit('fldcw ' .. address(control))
+      load_memory(into,address(result)); normalize(into); return
+    end
+  end
   if ct.floating(into) then
     if ct.floating(from) then
       xmm_in(from,'%xmm0'); emit(sse.convert(from, into))
@@ -434,10 +497,10 @@ local function convert(e: Expr,k: Id,cast: boolean): Expr
   if not scalar(e.kind) or not scalar(k) then fail('unsupported scalar conversion') end
   if k == Kind.Bool then truth(e.kind)
   elseif ct.is_pointer(k) then
-    if ct.floating(e.kind) or (not cast and not e.null_constant and
+    if ct.floating(e.kind) or ct.long_double(e.kind) or (not cast and not e.null_constant and
         (not ct.is_pointer(e.kind) or not compatible_pointer(k,e.kind))) then fail('incompatible pointer conversion') end
   elseif ct.is_pointer(e.kind) then
-    if not cast or ct.floating(k) then fail('incompatible pointer conversion') end
+    if not cast or ct.floating(k) or ct.long_double(k) then fail('incompatible pointer conversion') end
     normalize(k)
   else numeric_conversion(e.kind,k) end
   return {kind=k,null_constant=e.null_constant and (ct.is_integer(k) or k == ct.pointer(Kind.Void))}
@@ -469,7 +532,8 @@ local function change(e: Expr, up: boolean, postfix: boolean): Expr
   writable(e)
   emit('movq %rax, %rcx'); load_memory(e.kind,'(%rcx)')
   if postfix then emit('movq %rax, %r10') end
-  if ct.floating(e.kind) then
+  if ct.long_double(e.kind) then fail('long double increment and decrement are unsupported')
+  elseif ct.floating(e.kind) then
     xmm_in(e.kind, '%xmm0')
     immediate(e.kind == Kind.Float and 0x3f800000 or 0x3ff0000000000000)
     xmm_in(e.kind, '%xmm1')
@@ -488,7 +552,7 @@ end
 local function condition(e: Expr)
   e=value(e)
   if not scalar(e.kind) then fail('condition must be scalar') end
-  if ct.floating(e.kind) then truth(e.kind) end
+  if ct.floating(e.kind) or ct.long_double(e.kind) then truth(e.kind) end
   emit('testq %rax, %rax')
 end
 
@@ -515,6 +579,11 @@ local va_fixed: Abi
 local va_last: string
 
 local function place(abi: *Abi,k: Id): Placement
+  if ct.long_double(k) then
+    if abi.ms then fail('unsupported Microsoft x64 long double argument') end
+    abi.stack=abi.stack+2
+    return {kind=k}
+  end
   if abi.ms then
     if not scalar(k) then fail('unsupported Microsoft x64 argument type') end
     if abi.gp < 4 then abi.gp = abi.gp+1; return {kind=k, reg=abi.gp} end
@@ -673,7 +742,12 @@ local function call(target: Expr): Expr
   local pad=(depth+abi.stack)%2 ~= 0
   if pad then emit('subq $8, %rsp') end
   for i=count,1,-1 do
-    if args[i].reg == 0 then emit('pushq ' .. tostring((count-i)*8) .. '(%r10)') end
+    if args[i].reg == 0 then
+      if ct.long_double(args[i].kind) then
+        emit('movq ' .. tostring((count-i)*8) .. '(%r10), %rax')
+        emit('pushq 8(%rax)'); emit('pushq (%rax)')
+      else emit('pushq ' .. tostring((count-i)*8) .. '(%r10)') end
+    end
   end
   if abi.ms then emit('subq $32, %rsp')
   elseif sig.variadic or sig.unspecified then emit('movl $' .. tostring(abi.sse) .. ', %eax') end
@@ -693,7 +767,9 @@ local function call(target: Expr): Expr
     return {kind=sig.result}
   end
   if sig.result ~= Kind.Void and not scalar(sig.result) then fail('unsupported call result') end
-  if ct.floating(sig.result) then xmm_out(sig.result,'%xmm0') else normalize(sig.result) end
+  if ct.long_double(sig.result) then
+    local slot=reserve(sig.result); emit('fstpt ' .. address(slot)); emit('leaq ' .. address(slot) .. ', %rax')
+  elseif ct.floating(sig.result) then xmm_out(sig.result,'%xmm0') else normalize(sig.result) end
   return {kind=sig.result}
 end
 
@@ -801,6 +877,11 @@ local function variadic_builtin(op: string): Expr
     if not scalar(k) or k == Kind.Float or (ct.is_integer(k) and ct.promote(k) ~= k) then
       fail('unsupported or unpromoted variadic argument type')
     end
+    if ct.long_double(k) then
+      emit('movq 8(%rax), %rcx'); emit('addq $15, %rcx'); emit('andq $-16, %rcx')
+      emit('leaq 16(%rcx), %rdx'); emit('movq %rdx, 8(%rax)'); emit('movq %rcx, %rax')
+      return {kind=k}
+    end
     local floating = ct.floating(k)
     local field = floating and '4(%rax)' or '(%rax)'
     local stack, done = label(), label()
@@ -845,7 +926,14 @@ function unary(): Expr
   elseif take('++') or take('--') then return change(unary(),op == '++',false)
   elseif take('+') or take('-') or take('~') then
     local e=value(unary())
-    if ct.floating(e.kind) then
+    if ct.long_double(e.kind) then
+      if op == '~' then fail('integer operand required') end
+      if op == '-' then
+        emit('fldt (%rax)'); emit('fchs')
+        local slot=reserve(Kind.LongDouble); emit('fstpt ' .. address(slot)); emit('leaq ' .. address(slot) .. ', %rax')
+      end
+      return {kind=e.kind}
+    elseif ct.floating(e.kind) then
       if op == '~' then fail('integer operand required') end
       if op == '-' then emit(e.kind == Kind.Float and 'xorl $0x80000000, %eax' or 'btcq $63, %rax') end
       return {kind=e.kind}
@@ -915,6 +1003,11 @@ function unary(): Expr
     return postfix({kind=Kind.Int,null_constant=n == 0})
   elseif #token > 0 and (digit(token:byte(1)) or token:byte(1) == 46) then
     if fp.token(token) then
+      if token:sub(-1):lower() == 'l' then
+        local name=long_double_symbol(token)
+        emit('leaq ' .. name .. '(%rip), %rax')
+        next_token(); return postfix({kind=Kind.LongDouble})
+      end
       local bits,k=fp.literal(token)
       if k == Kind.Unknown then fail('invalid or unsupported floating literal') end
       immediate(bits); next_token(); return postfix({kind=k})
@@ -1006,6 +1099,30 @@ local function float_binary(op: string,a: Expr,b: Expr,k: Id): Expr
   return {}
 end
 
+-- Long double expressions are addresses of 16-byte temporaries. Keep the
+-- x87 stack transient so normal C expression evaluation never leaks x87 depth.
+local function long_double_binary(op: string): Expr
+  emit('fldt (%rax)') -- right operand
+  emit('fldt (%rcx)') -- left operand
+  if op == '==' or op == '!=' or op == '<' or op == '<=' or op == '>' or op == '>=' then
+    emit('fucomip %st(1), %st'); emit('fstp %st(0)')
+    if op == '==' then emit('sete %al'); emit('setnp %dl'); emit('andb %dl, %al')
+    elseif op == '!=' then emit('setne %al'); emit('setp %dl'); emit('orb %dl, %al')
+    elseif op == '<' then emit('setb %al'); emit('setnp %dl'); emit('andb %dl, %al')
+    elseif op == '<=' then emit('setbe %al'); emit('setnp %dl'); emit('andb %dl, %al')
+    elseif op == '>' then emit('seta %al')
+    else emit('setae %al') end
+    emit('movzbl %al, %eax')
+    return {kind=Kind.Int}
+  end
+  local instruction=op == '+' and 'faddp' or (op == '-' and 'fsubp' or (op == '*' and 'fmulp' or (op == '/' and 'fdivp' or '')))
+  if #instruction == 0 then fail('invalid long double operator ' .. op) end
+  emit(instruction .. ' %st, %st(1)')
+  local slot=reserve(Kind.LongDouble)
+  emit('fstpt ' .. address(slot)); emit('leaq ' .. address(slot) .. ', %rax')
+  return {kind=Kind.LongDouble}
+end
+
 -- At entry RCX holds the left operand and RAX holds the right.
 local function binary(op: string, a: Expr, b: Expr): Expr
   local equality=op == '==' or op == '!='
@@ -1029,7 +1146,13 @@ local function binary(op: string, a: Expr, b: Expr): Expr
     end
     fail('invalid pointer operands')
   end
-  if ct.floating(a.kind) or ct.floating(b.kind) then
+  if ct.long_double(a.kind) or ct.long_double(b.kind) then
+    if a.kind ~= Kind.LongDouble or b.kind ~= Kind.LongDouble then
+      push_result(); emit('movq %rcx, %rax'); convert(a,Kind.LongDouble,false); emit('movq %rax, %rcx')
+      pop_result('%rax'); convert(b,Kind.LongDouble,false)
+    end
+    return long_double_binary(op)
+  elseif ct.floating(a.kind) or ct.floating(b.kind) then
     if not scalar(a.kind) or not scalar(b.kind) then fail('expected arithmetic operands') end
     return float_binary(op,a,b,ct.common(a.kind,b.kind))
   end
@@ -1128,7 +1251,8 @@ function expression(minimum: integer): Expr
       emit('jmp ' .. yes_convert); emit(other .. ':')
       local no=value(expression(p))
       local k=yes.kind
-      if (ct.is_integer(k) or ct.floating(k)) and (ct.is_integer(no.kind) or ct.floating(no.kind)) then k=ct.common(k,no.kind)
+      if (ct.is_integer(k) or ct.floating(k) or ct.long_double(k)) and
+          (ct.is_integer(no.kind) or ct.floating(no.kind) or ct.long_double(no.kind)) then k=ct.common(k,no.kind)
       elseif ct.is_pointer(k) and no.null_constant then
       elseif ct.is_pointer(no.kind) and yes.null_constant then k=no.kind
       elseif ct.is_pointer(k) and ct.is_pointer(no.kind) and compatible_pointer(k,no.kind) then
@@ -1296,7 +1420,7 @@ local function byte_array(k: Id): boolean
   return ct.is_array(k) and (e == Kind.Char or e == Kind.SChar or e == Kind.UChar)
 end
 
-local function floating_initializer(words: *ce.Tokens, k: Id): integer
+local function floating_initializer(words: *ce.Tokens, k: Id): (integer,uint64,uint16)
   local first, last: integer = 1, (@integer)(#($words))
   while first < last and ($words)[first] == '(' and ($words)[last] == ')' do
     first, last = first + 1, last - 1
@@ -1305,15 +1429,21 @@ local function floating_initializer(words: *ce.Tokens, k: Id): integer
     local sign = ($words)[first]
     if sign == '+' or sign == '-' then first = first + 1 end
     if first == last and fp.token(($words)[first]) then
+      if k == Kind.LongDouble and ($words)[first]:sub(-1):lower() == 'l' then
+        local significand,sign_exponent,from=fp.literal_long_double(($words)[first])
+        if from == Kind.Unknown then fail('invalid floating initializer') end
+        if sign == '-' then sign_exponent=sign_exponent ~ 0x8000 end
+        return 0,significand,sign_exponent
+      end
       local bits, from = fp.literal(($words)[first])
       if from == Kind.Unknown then fail('invalid floating initializer') end
       if sign == '-' then bits = bits ~ (from == Kind.Float and 0x80000000 or (-9223372036854775807-1)) end
-      return fp.convert(bits, from, k)
+      return fp.convert(bits, from, k),0,0
     end
   end
   local n, ok, from = ce.evaluate(words, &enumerators, &aliases)
   if not ok then fail('unsupported floating constant expression') end
-  return fp.convert(n, from, k)
+  return fp.convert(n, from, k),0,0
 end
 
 local InitializerTarget = @record{kind: Id, offset: integer, index: integer}
@@ -1437,9 +1567,12 @@ local function global_init(k: Id, out: *sequence(string)): Id
       local symbol,source_type=address_constant(&words,1,#words)
       if symbol ~= '0' and not compatible_pointer(source_type,k) then fail('incompatible pointer initializer') end
       out:push('  .quad ' .. symbol)
-    elseif ct.floating(k) then
-      local bits = floating_initializer(&words, k)
-      out:push((k == Kind.Float and '  .long ' or '  .quad ') .. tostring(bits))
+    elseif ct.floating(k) or ct.long_double(k) then
+      local bits,significand,sign_exponent = floating_initializer(&words, k)
+      if ct.long_double(k) then
+        out:push('  .quad ' .. tostring(significand)); out:push('  .short ' .. tostring(sign_exponent))
+        for i=1,6 do out:push('  .byte 0') end
+      else out:push((k == Kind.Float and '  .long ' or '  .quad ') .. tostring(bits)) end
     else
       if not ct.is_integer(k) then fail('unsupported initializer') end
       local v,ok=ce.evaluate(&words, &enumerators, &aliases)
@@ -1748,7 +1881,8 @@ function statement(ret: string)
     elseif token ~= ';' then
       if value(expression(1)).kind ~= Kind.Void then fail('unexpected return value') end
     end
-    if ct.floating(function_result) then xmm_in(function_result,'%xmm0') end
+    if ct.long_double(function_result) then emit('fldt (%rax)')
+    elseif ct.floating(function_result) then xmm_in(function_result,'%xmm0') end
     expect(';'); emit('jmp ' .. ret)
   elseif not take(';') then value(expression(1)); expect(';') end
 end
@@ -1791,7 +1925,11 @@ local function compile_function(d: headers.Declaration)
       if a.reg == 0 then
         emit('movq ' .. tostring((abi.ms and 48 or 16) + stack*8) .. '(%rbp), %rax')
         emit('movq %rax, ' .. dest)
-        stack = stack + 1
+        if ct.long_double(a.kind) then
+          emit('movq ' .. tostring((abi.ms and 56 or 24) + stack*8) .. '(%rbp), %rax')
+          emit('movq %rax, ' .. address(v.slot-8))
+          stack = stack + 2
+        else stack = stack + 1 end
       elseif ct.floating(a.kind) then
         xmm_out(a.kind, '%xmm' .. tostring(a.reg-1)); store_memory(a.kind, dest)
       else emit('movq ' .. argument_register(abi.ms,a.reg) .. ', ' .. dest) end
