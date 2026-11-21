@@ -64,6 +64,49 @@ test "$expected" -eq 35
 test "$actual" -eq "$expected"
 test -z "$(nm -u "$out/abi")"
 
+cat > "$out/aggregate-zero.c" <<'C'
+struct Inner { int value; void *pointer; };
+struct Outer { struct Inner items[2]; int tail; };
+struct Reset { struct Inner item; };
+struct Small { char bytes[3]; char sentinel; };
+struct Pair { int first, second; };
+union PairUnion { struct Inner item; long word; };
+struct Outer global = {0};
+struct Outer globals[2] = {{0}, {0,}};
+struct Reset reset_global = {.item = {.value = 5, .pointer = &global}, .item = {0}};
+struct Small small_global = {.sentinel = 77, .bytes = {0}};
+struct Pair pair_global = {0, 9};
+union PairUnion union_global = {0,};
+int scalar_global = {0};
+int main(void) {
+    struct Outer local = {0,};
+    struct Outer locals[2] = {{0}, {0}};
+    struct Reset reset_local = {.item = {.value = 5, .pointer = &global}, .item = {0,}};
+    struct Small small_local = {.sentinel = 77, .bytes = {0}};
+    struct Pair pair_local = {0, 8};
+    union PairUnion union_local = {0};
+    int scalar_local = {0,};
+    return global.items[1].value + (global.items[0].pointer != 0)
+         + globals[1].items[1].value + (globals[0].items[0].pointer != 0)
+         + local.items[1].value + (local.items[0].pointer != 0)
+         + locals[1].items[1].value + (locals[0].items[0].pointer != 0)
+         + reset_global.item.value + (reset_global.item.pointer != 0)
+         + reset_local.item.value + (reset_local.item.pointer != 0)
+         + (small_global.sentinel != 77) + (small_local.sentinel != 77)
+         + pair_global.first + (pair_global.second != 9)
+         + pair_local.first + (pair_local.second != 8)
+         + union_global.item.value + union_local.item.value
+         + scalar_global + scalar_local;
+}
+C
+"$necc" "$out/aggregate-zero.c" -o "$out/aggregate-zero.s"
+"$as" --64 "$out/aggregate-zero.s" -o "$out/aggregate-zero.o"
+"$ld" -m elf_x86_64 -static -e _start "$out/aggregate-zero.o" \
+    --whole-archive "$archive" --no-whole-archive "$@" -o "$out/aggregate-zero"
+"$cc" -std=c11 -Wall -Wextra -Werror -Wno-missing-braces -Wno-override-init "$out/aggregate-zero.c" -o "$out/aggregate-zero-reference"
+"$out/aggregate-zero-reference"
+"$out/aggregate-zero"
+
 reject() {
     printf '%s\n' "$1" > "$out/bad.i"
     if "$necc" "$out/bad.i" -o "$out/rejected.s" 2> "$out/error"; then

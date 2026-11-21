@@ -495,7 +495,11 @@ local function unary(): Expr <forwarddecl> end
 local function local_init(k: Id, slot: integer) <forwarddecl> end
 
 local function zero_local(k: Id, slot: integer)
-  for off = 0, ct.size(k)-1, 8 do emit('movq $0, ' .. address(slot-off)) end
+  local off, size: integer = 0, ct.size(k)
+  while off + 8 <= size do emit('movq $0, ' .. address(slot-off)); off=off+8 end
+  if off + 4 <= size then emit('movl $0, ' .. address(slot-off)); off=off+4 end
+  if off + 2 <= size then emit('movw $0, ' .. address(slot-off)); off=off+2 end
+  if off < size then emit('movb $0, ' .. address(slot-off)) end
 end
 
 local Placement = @record{kind: Id, reg: integer}
@@ -1302,6 +1306,27 @@ local function insert_fragment(fragments: *sequence(Fragment), item: Fragment)
   else fragments:insert(at + 1, item) end
 end
 
+-- A braced zero initializer initializes every subobject, even when the first
+-- member is itself an aggregate. Recognize this common C form before recursively
+-- parsing the first element as though it needed another pair of braces.
+local function consume_zero_brace_initializer(): boolean
+  if token ~= '{' then return false end
+  local at,ln,tl,head,path,current,qualified=offset,line,token_line,inside_header,source_path,token,qualified_storage
+  next_token()
+  if token ~= '0' then
+    offset,line,token_line,inside_header,source_path,token,qualified_storage=at,ln,tl,head,path,current,qualified
+    return false
+  end
+  next_token()
+  if token == ',' then next_token() end
+  if token ~= '}' then
+    offset,line,token_line,inside_header,source_path,token,qualified_storage=at,ln,tl,head,path,current,qualified
+    return false
+  end
+  next_token()
+  return true
+end
+
 local function global_init(k: Id, out: *sequence(string)): Id
   if byte_array(k) and #token > 0 and token:byte(1) == 34 then
     local bytes = strings()
@@ -1314,6 +1339,12 @@ local function global_init(k: Id, out: *sequence(string)): Id
     space(out, bound-count)
     return ct.array(ct.element(k), bound)
   elseif ct.is_record(k) or ct.is_array(k) then
+    if consume_zero_brace_initializer() then
+      if ct.is_array(k) and ct.count(k) == 0 then k=ct.array(ct.element(k),1) end
+      if ct.size(k) == 0 then fail('initializer needs a complete type') end
+      space(out,ct.size(k))
+      return k
+    end
     expect('{')
     local fragments: sequence(Fragment)
     local next_index, max_count: integer = 0, 0
@@ -1410,6 +1441,12 @@ function local_init(k: Id, slot: integer)
       local source_value = value(expression(2))
       emit('leaq ' .. address(slot) .. ', %rdx')
       copy_record(k, source_value.kind)
+      return
+    end
+    if consume_zero_brace_initializer() then
+      -- A later designated initializer may replace a previously initialized
+      -- aggregate, so clear its full storage before applying the zero value.
+      zero_local(k,slot)
       return
     end
     expect('{')
