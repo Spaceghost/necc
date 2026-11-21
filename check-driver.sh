@@ -6,6 +6,7 @@ if [ "$#" -ne 3 ]; then
     exit 2
 fi
 necc=$1
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 export NECC_SYSROOT=$2
 mkdir -p "$3"
 work=$(mktemp -d "$3/necc-driver.XXXXXXXX")
@@ -53,32 +54,7 @@ check_c ./two
 "$necc" '-Iuser headers' -DINC=2 -c 'hello world.c' -o native.o
 "$necc" native.o -o three
 check_c ./three
-cat > atomic-builtins.c <<'C'
-int main(void) {
-    int value = 0;
-    int expected = -1;
-    if (__atomic_load_n(&value, __ATOMIC_RELAXED) != 0) return 1;
-    __atomic_store_n(&value, 2, __ATOMIC_RELEASE);
-    if (__atomic_fetch_add(&value, 3, __ATOMIC_ACQUIRE) != 2) return 2;
-    if (__atomic_load_n(&value, __ATOMIC_SEQ_CST) != 5) return 3;
-    if (__atomic_add_fetch(&value, 2, __ATOMIC_RELAXED) != 7) return 4;
-    if (__atomic_sub_fetch(&value, 1, __ATOMIC_RELAXED) != 6) return 5;
-    if (__atomic_exchange_n(&value, 10, __ATOMIC_ACQ_REL) != 6) return 6;
-    if (__atomic_compare_exchange_n(&value, &expected, 12, 0,
-                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 7;
-    if (expected != 10 || __atomic_load_n(&value, __ATOMIC_RELAXED) != 10) return 8;
-    expected = 10;
-    if (!__atomic_compare_exchange_n(&value, &expected, 12, 1,
-                                     __ATOMIC_RELEASE, __ATOMIC_RELAXED)) return 9;
-    if (__atomic_load_n(&value, __ATOMIC_SEQ_CST) != 12) return 10;
-    unsigned char byte = 254;
-    if (__atomic_add_fetch(&byte, 3, __ATOMIC_SEQ_CST) != 1) return 11;
-    unsigned short half = 65534;
-    if (__atomic_add_fetch(&half, 3, __ATOMIC_RELAXED) != 1) return 12;
-    return 0;
-}
-C
-"$necc" atomic-builtins.c -o atomic-builtins
+"$necc" "$script_dir/tests/atomic_builtins.c" -o atomic-builtins
 ./atomic-builtins
 cat > atomic-bool.c <<'C'
 int main(void) { _Bool value = 0; return __atomic_load_n(&value, __ATOMIC_RELAXED); }
