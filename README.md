@@ -193,10 +193,12 @@ identical archives.
 
 To build more of Nelibc with necc, pass the nelinker and necc source
 directories after the output prefix. From an empty build directory, the
-graph below builds both tools against the seed SDK. The new C frontend
-also compiles the allocator, crypt, floating-point environment, inet,
-regex, spawn, termios, pthread and wordexp modules. This brings the native
-total to 17 of 47 objects. TinyCC compiles 19 and GCC supplies eleven.
+graph below builds both tools against the seed SDK. The staged necc
+generates code for 26 of the 47 objects, including memory and string
+operations, character classification and conversion, account lookup,
+search, unistd, POSIX message queues and System V IPC. Twenty of these
+objects come from Nelua modules and six from C adapters. TinyCC compiles
+ten other objects and GCC supplies eleven.
 The staged nelinker writes the indexed archive and links the Lua runtime.
 The seed SDK must be on an absolute path. Relative tool and output names
 are relative to the build directory.

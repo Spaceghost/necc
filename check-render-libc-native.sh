@@ -48,16 +48,18 @@ render() {
 recipe() {
     awk -v target="$1" '$1 == "build" && $2 == target {getline; print; exit}' "$2"
 }
-legacy_objects='alloc crypt fenv inet regex spawn termios thread wordexp'
-native_objects='slocale exit extras sys-linux sysops fcntl semaphore syscall alloc crypt fenv inet regex spawn termios thread wordexp'
+native_objects=$(cat "$script_dir/tests/native-libc-members.txt")
+set -- $native_objects
+native_count=$#
+stage_rebuild_count=$((native_count + 2))
 
-# The source extension is opt-in: all existing 4-, 5-, and 6-argument graphs
-# retain their compiler selection.
+# The 4-, 5-, and 6-argument graphs keep the seed compiler's original coverage.
 render legacy4
 render legacy5 libc
 render legacy6 libc "$nelinker_src"
 for graph in legacy4 legacy5 legacy6; do
-    for name in $legacy_objects; do
+    for name in $native_objects; do
+        case "$name" in slocale|exit|extras|sys-linux|sysops|fcntl|semaphore|syscall) continue;; esac
         if [ "$graph" = legacy4 ]; then target=$name.o; else target=libc/$name.o; fi
         line=$(recipe "$target" "$out/$graph/build.ne")
         case "$line" in *"$sdk/tcc/tcc"*) ;; *) echo "$graph unexpectedly selected native necc for $name" >&2; exit 1;; esac
@@ -76,7 +78,7 @@ for name in $native_objects; do
     line=$(recipe "libc/$name.o" "$graph")
     case "$line" in *"'libc/necc' '-c'"*) ;; *) echo "native graph did not select libc/necc for $name" >&2; exit 1;; esac
 done
-test "$(grep -Fc "'libc/necc' '-c'" "$graph")" -eq 17
+test "$(grep -Fc "'libc/necc' '-c'" "$graph")" -eq "$native_count"
 
 render prefixless '' "$nelinker_src" "$necc_src"
 graph=$out/prefixless/build.ne
@@ -93,7 +95,7 @@ cd "$out/native"
 test -x libc/necc
 test -x libc/nelinker
 for name in $native_objects; do test -s "libc/$name.o"; done
-test "$(grep -Fc "'libc/necc' '-c'" first-build.log)" -eq 17
+test "$(grep -Fc "'libc/necc' '-c'" first-build.log)" -eq "$native_count"
 "$script_dir/check-libc.sh" "$out/native/libc/necc" "$sdk" "$nelibc" \
     "$gcc" "$out/native/libc/libnelibc.a" "$out/checks"
 "$nebuild" -j 2 build.ne libc/libnelibc.a > warm-build.log 2>&1
@@ -107,17 +109,17 @@ cp "$necc_src"/*.nelua "$out/compiler-source/"
 (cd "$out/native" && "$seed" --lua "$renderer" "$seed" "$sdk" "$nelibc" \
     "$gcc" libc "$nelinker_src" "$out/compiler-source" > build.ne)
 "$nebuild" -j 2 "$out/native/build.ne" libc/libnelibc.a > copy-source-build.log 2>&1
-test "$(wc -l < copy-source-build.log)" -eq 19
-test "$(grep -Fc "'libc/necc' '-c'" copy-source-build.log)" -eq 17
+test "$(wc -l < copy-source-build.log)" -eq "$stage_rebuild_count"
+test "$(grep -Fc "'libc/necc' '-c'" copy-source-build.log)" -eq "$native_count"
 test "$(grep -Fc "'--release'" copy-source-build.log)" -eq 1
 test "$(grep -Fc "'libc/nelinker' '--archive'" copy-source-build.log)" -eq 1
 printf '\n-- source dependency regression comment\n' >> "$out/compiler-source/leaf.nelua"
 "$nebuild" -j 2 "$out/native/build.ne" libc/libnelibc.a > changed-source-build.log 2>&1
-test "$(wc -l < changed-source-build.log)" -eq 19
-test "$(grep -Fc "'libc/necc' '-c'" changed-source-build.log)" -eq 17
+test "$(wc -l < changed-source-build.log)" -eq "$stage_rebuild_count"
+test "$(grep -Fc "'libc/necc' '-c'" changed-source-build.log)" -eq "$native_count"
 test "$(grep -Fc "'--release'" changed-source-build.log)" -eq 1
 test "$(grep -Fc "'libc/nelinker' '--archive'" changed-source-build.log)" -eq 1
 "$nebuild" -j 2 "$out/native/build.ne" libc/libnelibc.a > final-warm-build.log 2>&1
 test ! -s final-warm-build.log
 
-printf '17 native libc objects, seed-mode compatibility, prefixless commands, archive consumers, 19-edge compiler-source rebuild, and zero-recipe warm rebuild passed in %s\n' "$out"
+printf '%s native libc objects, seed-mode compatibility, prefixless commands, archive consumers, %s-recipe compiler-source rebuild, and zero-recipe warm rebuild passed in %s\n' "$native_count" "$stage_rebuild_count" "$out"
