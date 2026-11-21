@@ -84,7 +84,25 @@ grep -q 'same file' rejected
 cmp archive-alias 'helper library.a'
 if "$necc" -c entry.c helper.c -o ambiguous.o 2> rejected; then exit 1; fi
 test ! -e ambiguous.o
-echo 'Multi-file native C, ordered static archives, mixed Nelua/C, and atomic failed links passed'
+cat > attributes.c <<'C'
+int __attribute__((__pure__)) pure_prefix(int);
+__attribute__((pure)) int pure_middle(int);
+int pure_suffix(int) __attribute__((pure));
+int __attribute__((__const__)) const_prefix(int);
+int const_suffix(int) __attribute__((const));
+int pure_prefix(int value) { return value + 1; }
+int pure_middle(int value) { return value + 2; }
+int pure_suffix(int value) { return value + 3; }
+int const_prefix(int value) { return value + 4; }
+int const_suffix(int value) { return value + 5; }
+int main(void) {
+    return pure_prefix(0) + pure_middle(0) + pure_suffix(0) +
+           const_prefix(0) + const_suffix(0) == 15 ? 0 : 1;
+}
+C
+"$necc" attributes.c -o attributes
+./attributes
+echo 'Multi-file native C, ordered static archives, GNU pure/const attributes, mixed Nelua/C, and atomic failed links passed'
 cat > bytes.c <<'C'
 const unsigned char table[3 + 2] = {0x41, 0377, 0x80};
 unsigned char values[] = {0, 0, 0};

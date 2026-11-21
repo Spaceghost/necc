@@ -45,7 +45,8 @@ local function function_attribute(c: *Cursor): string
   if take(c, '(') and take(c, '(') then
     local name = peek(c,0)
     if name == 'ms_abi' or name == '__ms_abi__' or name == 'noreturn' or name == '__noreturn__' or
-        name == 'returns_twice' or name == '__returns_twice__' then
+        name == 'returns_twice' or name == '__returns_twice__' or name == 'pure' or name == '__pure__' or
+        name == 'const' or name == '__const__' then
       c.at = c.at + 1
       if take(c, ')') and take(c, ')') then return name end
     end
