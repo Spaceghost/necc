@@ -179,6 +179,19 @@ if "$necc" -c wrong.c -o invalid.o 2>error; then exit 1; fi
 grep -q 'conflicting declaration' error
 test ! -e invalid.o
 cat > wrong.c <<'C'
+long double __attribute__((ms_abi)) unsupported_result(void) { return 1.0L; }
+C
+if "$necc" -c wrong.c -o invalid.o 2>error; then exit 1; fi
+grep -q 'unsupported Microsoft x64 long double result' error
+test ! -e invalid.o
+cat > wrong.c <<'C'
+extern long double __attribute__((ms_abi)) unsupported_result(void);
+long double call_unsupported_result(void) { return unsupported_result(); }
+C
+if "$necc" -c wrong.c -o invalid.o 2>error; then exit 1; fi
+grep -q 'unsupported Microsoft x64 long double result' error
+test ! -e invalid.o
+cat > wrong.c <<'C'
 int __attribute__((ms_abi, __pure__)) off();
 int off(int x) { return x; }
 C

@@ -531,9 +531,20 @@ end
 local function change(e: Expr, up: boolean, postfix: boolean): Expr
   writable(e)
   emit('movq %rax, %rcx'); load_memory(e.kind,'(%rcx)')
+  if ct.long_double(e.kind) then
+    if postfix then
+      local old=reserve(Kind.LongDouble)
+      store_memory(Kind.LongDouble,address(old)); emit('leaq ' .. address(old) .. ', %rax'); push_result()
+    end
+    emit('fld1'); emit('fldt (%rcx)')
+    emit(up and 'faddp %st, %st(1)' or 'fsubp %st, %st(1)')
+    local updated=reserve(Kind.LongDouble); emit('fstpt ' .. address(updated)); emit('leaq ' .. address(updated) .. ', %rax')
+    store_memory(Kind.LongDouble,'(%rcx)')
+    if postfix then pop_result('%rax') end
+    return {kind=e.kind}
+  end
   if postfix then emit('movq %rax, %r10') end
-  if ct.long_double(e.kind) then fail('long double increment and decrement are unsupported')
-  elseif ct.floating(e.kind) then
+  if ct.floating(e.kind) then
     xmm_in(e.kind, '%xmm0')
     immediate(e.kind == Kind.Float and 0x3f800000 or 0x3ff0000000000000)
     xmm_in(e.kind, '%xmm1')
@@ -682,6 +693,9 @@ local function call(target: Expr): Expr
     push_result()
   end
   local sig=ct.signature(fn)
+  if sig.ms_abi and ct.long_double(sig.result) then
+    fail('unsupported Microsoft x64 long double result')
+  end
   if not sig.ms_abi then calls_sysv = true end
   local args: sequence(Placement)
   local logical_count: integer = 0
@@ -1912,6 +1926,9 @@ end
 
 local function compile_function(d: headers.Declaration)
   local sig=register_fn(d,true)
+  if sig.ms_abi and ct.long_double(sig.result) then
+    fail('unsupported Microsoft x64 long double result')
+  end
   slots, va_save_slot, indirect_result_slot = 0, 0, 0
   function_ms, calls_sysv, uses_string_copy = sig.ms_abi, false, false
   local abi: Abi = {ms=sig.ms_abi}

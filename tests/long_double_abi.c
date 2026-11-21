@@ -115,6 +115,14 @@ long double necc_long_double_snapshot(long double *value) {
   return gcc_long_double_capture(*value, gcc_long_double_mutate(value));
 }
 
+long double necc_long_double_prefix_increment(long double *value) {
+  return ++*value;
+}
+
+long double necc_long_double_postfix_decrement(long double *value) {
+  return (*value)--;
+}
+
 static long double from_integer = 3 * 7;
 static long double from_unsigned = 18446744073709551615ULL;
 static long double from_double = 1.0000000000000000001;

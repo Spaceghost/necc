@@ -27,6 +27,8 @@ extern long double necc_long_double_many_args(unsigned long, unsigned long, unsi
                                                unsigned long, unsigned long, unsigned long,
                                                unsigned long, long double, int);
 extern long double necc_long_double_snapshot(long double *);
+extern long double necc_long_double_prefix_increment(long double *);
+extern long double necc_long_double_postfix_decrement(long double *);
 
 long double gcc_long_double_add(long double left, long double right) {
   return left + right;
@@ -76,6 +78,9 @@ int main(void) {
   if (necc_long_double_many_args(1, 2, 3, 4, 5, 6, 7, 0.5L, 9) != 37.5L) return 27;
   long double mutable_value = 1.25L;
   if (necc_long_double_snapshot(&mutable_value) != 1.25L || mutable_value != 99.0L) return 28;
+  mutable_value = 2.5L;
+  if (necc_long_double_prefix_increment(&mutable_value) != 3.5L || mutable_value != 3.5L) return 30;
+  if (necc_long_double_postfix_decrement(&mutable_value) != 3.5L || mutable_value != 2.5L) return 31;
   if (necc_long_double_truth(0.0L) != 0 || necc_long_double_truth(-0.0L) != 0) return 21;
   if (necc_long_double_truth(1.0L) != 1 || necc_long_double_truth(__builtin_nanl("")) != 1) return 22;
   if (!necc_long_double_less(1.0L, 2.0L) || necc_long_double_less(2.0L, 1.0L) ||
