@@ -76,6 +76,49 @@ C
 ./empty-values-gcc
 ./empty-values-necc
 
+cat > statement-expressions.c <<'C'
+struct Pair { int first, second; };
+static int effects;
+static int next_value(void) { return ++effects; }
+static int consume_pair(struct Pair pair) { return pair.first + pair.second; }
+int main(void) {
+    int local = 90;
+    int result = ({ int local = next_value(); local + 2; }) * 3;
+    if (result != 9 || local != 90) return 1;
+    if (!(1 && ({ int value = 6; value == 6; }))) return 2;
+    int loop = ({ int index = 0; for (; index < 5; index++) {
+        if (index == 1) continue;
+        if (index == 3) break;
+    } index; });
+    if (loop != 3) return 3;
+    struct Pair pair = ({ struct Pair temporary = {11, 13}; temporary; });
+    if (pair.first != 11 || pair.second != 13) return 4;
+    if (consume_pair(({ struct Pair temporary = {17, 19}; temporary; })) != 36) return 5;
+    ({ effects += 2; });
+    ({ effects += 3; int discarded = 0; });
+    ({ effects += 1; (void)effects; });
+    if (effects != 7) return 6;
+    return 0;
+}
+C
+"$necc" -c statement-expressions.c -o statement-expressions.o
+"$cc" -std=gnu11 -O2 -o statement-expressions-gcc statement-expressions.c
+"$cc" -no-pie statement-expressions.o -o statement-expressions-necc
+./statement-expressions-gcc
+./statement-expressions-necc
+printf '%s\n' 'void f(void) { while (1) { int value = ({ break; 0; }); } }' > statement-expression-break.c
+if "$necc" -c statement-expression-break.c -o statement-expression-break.o 2>error; then
+    echo 'expected an outward statement-expression break to be rejected' >&2
+    exit 1
+fi
+grep -q 'break cannot escape a GNU statement expression' error
+printf '%s\n' 'int f(void) { int value = ({ goto outside; 0; }); outside: return value; }' > statement-expression-goto.c
+if "$necc" -c statement-expression-goto.c -o statement-expression-goto.o 2>error; then
+    echo 'expected a statement-expression goto to be rejected' >&2
+    exit 1
+fi
+grep -q 'goto is unsupported in a GNU statement expression' error
+
 cat > shared.h <<'C'
 #include <stdarg.h>
 #include <stddef.h>

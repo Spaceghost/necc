@@ -44,6 +44,8 @@ local rodata: sequence(string)
 local constants: sequence(string)
 local scope: integer = 1
 local function_result: Id
+local active_ret: string
+local statement_expression_depth: integer
 local function_ms: boolean
 local indirect_result_slot: integer
 local calls_sysv: boolean
@@ -569,6 +571,7 @@ end
 
 local function expression(minimum: integer): Expr <forwarddecl> end
 local function unary(): Expr <forwarddecl> end
+local function statement_expression(): Expr <forwarddecl> end
 
 local function local_init(k: Id, slot: integer) <forwarddecl> end
 
@@ -1012,6 +1015,7 @@ function unary(): Expr
     immediate(n)
     return {kind=Kind.ULong}
   elseif take('(') then
+    if take('{') then return postfix(statement_expression()) end
     if headers.starts_type(token,&aliases) and locals[token].level == 0 then
       local k=read_type()
       if token == '{' then
@@ -1781,7 +1785,7 @@ local function header_declaration()
   fail('unterminated header declaration')
 end
 
-local function statement(ret: string) <forwarddecl> end
+local function statement(ret: string): Expr <forwarddecl> end
 local function decl_group(top: boolean) <forwarddecl> end
 
 local function starts_decl(): boolean
@@ -1789,14 +1793,28 @@ local function starts_decl(): boolean
     token == 'extern' or token == 'typedef' or token == 'inline' or token == 'register'
 end
 
-local function block(ret: string, nested: boolean)
+local function block(ret: string, nested: boolean): Expr
   local mark=#bindings
+  local result: Expr = {kind=Kind.Void}
   if nested then scope=scope+1 end
   while not take('}') do
     if #token == 0 then fail('expected identifier or closing brace') end
-    if starts_decl() then decl_group(false) else statement(ret) end
+    if starts_decl() then decl_group(false); result={kind=Kind.Void}
+    else result=statement(ret) end
   end
   if nested then leave_scope(mark); scope=scope-1 end
+  return result
+end
+
+function statement_expression(): Expr
+  local saved_break,saved_continue=break_to,continue_to
+  break_to,continue_to='',''
+  statement_expression_depth=statement_expression_depth+1
+  local result = block(active_ret,true)
+  statement_expression_depth=statement_expression_depth-1
+  break_to,continue_to=saved_break,saved_continue
+  expect(')')
+  return result
 end
 
 local function test_branch(target: string)
@@ -1864,14 +1882,17 @@ local function case_label(is_default: boolean)
   expect(':'); emit(target .. ':')
 end
 
-function statement(ret: string)
+function statement(ret: string): Expr
+  local result: Expr = {kind=Kind.Void}
   if take('{') then block(ret,true)
   elseif take('switch') then switch_statement(ret)
   elseif token == 'case' or token == 'default' then
     local is_default=token == 'default'; next_token(); case_label(is_default); statement(ret)
   elseif take('goto') then
+    if statement_expression_depth > 0 then fail('goto is unsupported in a GNU statement expression') end
     local name=identifier(); expect(';'); emit('jmp ' .. jump_label(name))
   elseif allowed_name(token) and followed_by(':') then
+    if statement_expression_depth > 0 then fail('labels are unsupported in a GNU statement expression') end
     local name=identifier(); expect(':')
     if defined_labels[name] then fail('duplicate label ' .. name) end
     defined_labels[name]=true; emit(jump_label(name) .. ':'); statement(ret)
@@ -1907,7 +1928,10 @@ function statement(ret: string)
     leave_scope(mark); scope=scope-1
   elseif token == 'break' or token == 'continue' then
     local target=token == 'break' and break_to or continue_to
-    if #target == 0 then fail('invalid loop jump') end
+    if #target == 0 then
+      if statement_expression_depth > 0 then fail(token .. ' cannot escape a GNU statement expression') end
+      fail('invalid loop jump')
+    end
     next_token(); expect(';'); emit('jmp ' .. target)
   elseif take('return') then
     if ct.is_record(function_result) then
@@ -1923,7 +1947,8 @@ function statement(ret: string)
     if ct.long_double(function_result) then emit('fldt (%rax)')
     elseif ct.floating(function_result) then xmm_in(function_result,'%xmm0') end
     expect(';'); emit('jmp ' .. ret)
-  elseif not take(';') then value(expression(1)); expect(';') end
+  elseif not take(';') then result=value(expression(1)); expect(';') end
+  return result
 end
 
 local function compile_function(d: headers.Declaration)
@@ -1986,7 +2011,9 @@ local function compile_function(d: headers.Declaration)
   if sig.variadic then va_fixed, va_last = abi, d.params[#d.params].name end
   function_result=sig.result
   local ret=label()
+  active_ret=ret
   block(ret,false)
+  active_ret=''
   for name,target in pairs(jump_labels) do
     if not defined_labels[name] then fail('undefined label ' .. name) end
   end
