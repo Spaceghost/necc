@@ -121,7 +121,7 @@ test "$(wc -l < copy-source-build.log)" -eq "$stage_rebuild_count"
 test "$(grep -Fc "'libc/necc' '-c'" copy-source-build.log)" -eq "$native_count"
 test "$(grep -Fc "'--release'" copy-source-build.log)" -eq 3
 test "$(grep -Fc "'libc/nelinker' '--archive'" copy-source-build.log)" -eq 1
-printf '\n-- source dependency regression comment\n' >> "$out/compiler-source/leaf.nelua"
+printf '\n-- source dependency regression comment\n' >> "$out/compiler-source/affine.nelua"
 "$nebuild" -j 2 "$out/native/build.ne" libc/libnelibc.a > changed-source-build.log 2>&1
 test "$(wc -l < changed-source-build.log)" -eq "$stage_rebuild_count"
 test "$(grep -Fc "'libc/necc' '-c'" changed-source-build.log)" -eq "$native_count"

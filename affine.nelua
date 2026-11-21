@@ -1,0 +1,190 @@
+-- Batch side-effect-free integer recurrences after leaf-register promotion.
+require 'hashmap'
+require 'sequence'
+require 'string'
+
+local affine = @record{}
+local Lines = @sequence(string)
+local Labels = @hashmap(string, usize)
+local full: uint64 <comptime> = ~0_u64
+local names: []string = {'%r8', '%r9', '%r10', '%r11', '%rax'}
+local acc: integer <comptime> = 4
+local Form = @record{coeff: [4]uint64, constant: uint64, mask: uint64}
+local State = @record{value: [5]Form, written: [5]boolean}
+
+local function reg(s: string): integer
+  for n=0,4 do if s==names[n] then return n end end
+  return -1
+end
+
+local function label(line: string): string
+  if line:subview(1,9)=='  .Lnecc_' and line:byte(#line)==58 then
+    return line:subview(3,#line-1)
+  end
+  return ''
+end
+
+local function instruction(line: string): (string,string,string)
+  local i: integer=3
+  while i<=(#line) and line:byte(i)~=32 do i=i+1 end
+  local op=line:subview(3,i-1)
+  local start=i+1
+  while i<=(#line) and line:byte(i)~=44 do i=i+1 end
+  return op,line:subview(start,i-1),line:subview(i+2)
+end
+
+local function number(s: string): (uint64,boolean)
+  if #s<2 or s:byte(1)~=36 then return 0,false end
+  local at: usize=2
+  local negative=s:byte(at)==45
+  if negative then at=at+1 end
+  if at>#s then return 0,false end
+  local n: uint64=0
+  for i=at,#s do
+    local digit=s:byte(i)
+    if digit<48 or digit>57 then return 0,false end
+    n=n*10+(@uint64)(digit-48)
+  end
+  return negative and 0_u64-n or n,true
+end
+
+-- Each live value is a linear combination of the incoming registers plus
+-- a constant. A low-bit mask can only be copied or narrowed further. Every
+-- memory operand, branch, call, or unmodelled register effect rejects a region.
+local function evaluate(code: *Lines, first: usize, last: usize, state: *State): boolean
+  for i=first,last do
+    local op,src,dst=instruction(($code)[i])
+    local d=reg(dst)
+    local n,immediate=number(src)
+    if op=='movl' and dst=='%eax' and immediate then
+      state.value[acc]={constant=n & 0xffffffff_u64,mask=full}
+    else
+      if d<0 then return false end
+      local r=reg(src)
+      local rhs: Form={constant=n,mask=full}
+      if not immediate then
+        if r<0 then return false end
+        rhs=state.value[r]
+      end
+      local f=&state.value[d]
+      if op=='movq' then $f=rhs
+      elseif op=='andq' and immediate and (n & (n+1_u64))==0 then
+        f.mask=f.mask & n
+      elseif f.mask==full and rhs.mask==full then
+        if op=='addq' or op=='subq' then
+          local sign=op=='addq' and 1_u64 or full
+          for j=0,3 do f.coeff[j]=f.coeff[j]+sign*rhs.coeff[j] end
+          f.constant=f.constant+sign*rhs.constant
+        elseif op=='imulq' and immediate then
+          for j=0,3 do f.coeff[j]=f.coeff[j]*n end
+          f.constant=f.constant*n
+        else return false end
+      else return false end
+      state.written[d]=true
+    end
+  end
+  return true
+end
+
+local function immediate_op(out: *Lines, op: string, value: uint64, dst: string)
+  local imm='$' .. tostring((@int64)(value))
+  if (@uint64)((@int64)((@int32)(value)))==value then
+    out:push('  ' .. op .. ' ' .. imm .. ', ' .. dst)
+  else
+    out:push('  movq ' .. imm .. ', %rax')
+    out:push('  ' .. op .. ' %rax, ' .. dst)
+  end
+end
+
+local function batch(out: *Lines, code: *Lines, labels: *Labels, head: string, line: usize)
+  if line+5>=#($code) then return end
+  local load,iv,vdst=instruction(($code)[line+1])
+  local cmp,limit,cdst=instruction(($code)[line+2])
+  local exitop,target=instruction(($code)[line+3])
+  if load~='movq' or cmp~='cmpq' or vdst~='%rax' or cdst~='%rax' then return end
+  if exitop~='jge' and exitop~='jae' then return end
+  local idx,bound=reg(iv),reg(limit)
+  if idx<0 or idx>=acc or bound<0 or bound>=acc or idx==bound then return end
+  if not labels:has(target) then return end
+  local done=($labels)[target]
+  if done<=line+5 then return end
+  local state: State
+  for r=0,3 do state.value[r].coeff[r]=1; state.value[r].mask=full end
+  -- The condition leaves the induction variable in RAX on entry to the body.
+  state.value[acc]=state.value[idx]
+  local first=line+4
+  local op,entry=instruction(($code)[first])
+  if op=='jmp' then
+    -- In a for loop the increment block precedes the body in the assembly.
+    if not labels:has(entry) then return end
+    local start=($labels)[entry]
+    local advance=label(($code)[first+1])
+    if #advance==0 or start<=first+2 or start>=done-1 or
+       ($code)[start-1]~='  jmp ' .. head or ($code)[done-1]~='  jmp ' .. advance then return end
+    if not evaluate(code,start+1,done-2,&state) or
+       not evaluate(code,first+2,start-2,&state) then return end
+  else
+    if ($code)[done-1]~='  jmp ' .. head or not evaluate(code,first,done-2,&state) then return end
+  end
+  if state.written[bound] then return end
+  local nexti=state.value[idx]
+  if nexti.constant~=1 or nexti.mask~=full then return end
+  local carry: integer=-1
+  for r=0,3 do
+    if nexti.coeff[r]~=(r==idx and 1_u64 or 0_u64) then return end
+    if r~=idx and state.written[r] then
+      if carry>=0 then return end
+      carry=r
+    end
+  end
+  if carry<0 then return end
+  local f=state.value[carry]
+  for r=0,3 do if r~=idx and r~=carry and f.coeff[r]~=0 then return end end
+
+  -- Compose s' = a*s + b*i + c sixteen times in the ring of low bits.
+  -- Successive groups add b16*16 to the offset. No intermediate state or
+  -- higher bit is observable, so a single final mask also covers all groups.
+  local a,b,c=f.coeff[carry],f.coeff[idx],f.constant
+  local a16,b16,c16=1_u64,0_u64,0_u64
+  for step: uint64=0,<16 do
+    a16,b16,c16=a*a16,a*b16+b,a*c16+b*step+c
+  end
+  a16,b16,c16=a16 & f.mask,b16 & f.mask,c16 & f.mask
+  local s=names[carry]
+  -- Use scratch registers only after the signed or unsigned entry test.
+  -- Below the bound its unsigned distance is exact even across signed zero.
+  local restore,again=head .. '_restore',head .. '_batch'
+  out:push('  cmpq ' .. limit .. ', ' .. iv)
+  out:push('  ' .. exitop .. ' ' .. head)
+  out:push('  pushq %rcx'); out:push('  pushq %rdx')
+  out:push('  movq ' .. limit .. ', %rcx'); out:push('  subq ' .. iv .. ', %rcx')
+  out:push('  shrq $4, %rcx'); out:push('  je ' .. restore)
+  out:push('  movq ' .. iv .. ', %rdx')
+  immediate_op(out,'imulq',b16,'%rdx'); immediate_op(out,'addq',c16,'%rdx')
+  out:push('  movq %rcx, %rax'); out:push('  shlq $4, %rax')
+  out:push('  addq %rax, ' .. iv)
+  out:push(again .. ':')
+  immediate_op(out,'imulq',a16,s); out:push('  addq %rdx, ' .. s)
+  immediate_op(out,'addq',(b16*16) & f.mask,'%rdx')
+  out:push('  decq %rcx'); out:push('  jne ' .. again)
+  if f.mask~=full then immediate_op(out,'andq',f.mask,s) end
+  out:push(restore .. ':'); out:push('  popq %rdx'); out:push('  popq %rcx')
+  -- The scalar guard reestablishes the original flags and RAX and runs the
+  -- remainder. In particular, zero trips never mask the incoming state.
+end
+
+function affine.emit(out: *Lines, code: *Lines)
+  local labels: Labels
+  defer labels:destroy() end
+  for i: usize=1,#($code) do
+    local mark=label(($code)[i])
+    if #mark>0 then labels[mark]=i end
+  end
+  for i: usize=1,#($code) do
+    local row=($code)[i]
+    local head=label(row)
+    if #head>0 then batch(out,code,&labels,head,i) end
+    out:push(row)
+  end
+end
+return affine

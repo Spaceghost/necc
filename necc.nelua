@@ -8,6 +8,7 @@ local headers = require 'headers'
 local ct = require 'ctypes'
 local fp = require 'floating'
 local leaf = require 'leaf'
+local affine = require 'affine'
 local sse = require 'sse'
 local ce = require 'consteval'
 require 'hashmap'
@@ -54,6 +55,7 @@ local break_to: string
 local continue_to: string
 local assembly: sequence(string)
 local body: sequence(string)
+local counted_loop: boolean
 local slots: integer
 local depth: integer
 local label_count: integer
@@ -2068,6 +2070,7 @@ function statement(ret: string): Expr
     else emit(otherwise .. ':') end
   elseif token == 'while' or token == 'for' or token == 'do' then
     local loop=token; next_token()
+    if loop ~= 'do' then counted_loop=true end
     local saved_break,saved_continue=break_to,continue_to
     local mark=#bindings; scope=scope+1
     local check,start,advance,done=label(),label(),label(),label()
@@ -2115,6 +2118,7 @@ function statement(ret: string): Expr
 end
 
 local function compile_function(d: headers.Declaration)
+  counted_loop=false
   local sig=register_fn(d,true)
   if sig.ms_abi and ct.long_double(sig.result) then
     fail('unsupported Microsoft x64 long double result')
@@ -2208,7 +2212,8 @@ local function compile_function(d: headers.Declaration)
       for i = 6,15 do assembly:push(sse.frame(i,-saved+(i-5)*16,true)) end
     end
   end
-  for i: usize=1,#body do assembly:push(body[i]) end
+  if frameless and counted_loop then affine.emit(&assembly,&body)
+  else for i: usize=1,#body do assembly:push(body[i]) end end
   if saved ~= 0 then
     assembly:push('  movq ' .. address(saved) .. ', %rdi'); assembly:push('  movq ' .. address(saved-8) .. ', %rsi')
     if calls_sysv then

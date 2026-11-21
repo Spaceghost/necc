@@ -202,4 +202,12 @@ reject '/* unterminated' 'unterminated comment'
     "$out/memory-long-double.o" -o "$out/memory-long-double"
 "$out/memory-long-double"
 
+"$necc" "$repo/tests/affine_loops.c" -o "$out/affine-loops.s"
+batched=$(awk '/^[a-z_]+:$/ { name = substr($0, 1, length($0)-1) } /_batch:$/ { print name }' "$out/affine-loops.s")
+test "$batched" = "$(printf '%s\n' masked wrapping)"
+"$as" --64 "$out/affine-loops.s" -o "$out/affine-loops.o"
+"$cc" -std=c11 -O0 -Wall -Wextra -Werror "$repo/tests/affine_loops_main.c" \
+    "$out/affine-loops.o" -o "$out/affine-loops"
+"$out/affine-loops"
+
 echo "necc ABI, arithmetic and invalid input checks passed in $out"

@@ -17,7 +17,7 @@ LDFLAGS = -Wl,--whole-archive $(abspath $(NELIBC_ARCHIVE)) -Wl,--no-whole-archiv
 .PHONY: all test
 all: $(OUT)/necc
 
-$(OUT)/necc: necc.nelua driver.nelua headers.nelua ctypes.nelua floating.nelua sse.nelua consteval.nelua smallalloc.nelua leaf.nelua Makefile $(NELIBC_ARCHIVE)
+$(OUT)/necc: necc.nelua driver.nelua headers.nelua ctypes.nelua floating.nelua sse.nelua consteval.nelua smallalloc.nelua leaf.nelua affine.nelua Makefile $(NELIBC_ARCHIVE)
 	mkdir -p $(OUT)
 	$(NELUA) --cache-dir '$(abspath $(OUT)/nelua-cache)' -r --cc '$(ZIG) cc -mcpu=x86_64' --cflags='$(CFLAGS)' --ldflags='$(LDFLAGS)' -o '$@' necc.nelua
 	@undefined=$$(nm -u '$@') && test -z "$$undefined" || { echo "$$undefined"; exit 1; }
