@@ -987,6 +987,11 @@ function unary(): Expr
   elseif take('!') then
     condition(unary()); emit('sete %al'); emit('movzbl %al, %eax')
     return {kind=Kind.Int}
+  elseif take('__builtin_thread_pointer') then
+    expect('('); expect(')')
+    -- Linux x86-64 keeps the thread control block's self pointer at FS:0.
+    emit('movq %fs:0, %rax')
+    return postfix({kind=ct.pointer(Kind.Void)})
   elseif take('__builtin_offsetof') then
     local words: ce.Tokens
     words:push(op)

@@ -358,3 +358,28 @@ done
 "$necc" return_pointer.o functions-native.o -o return_pointer
 ./return_pointer
 printf 'SysV MEMORY return pointer in RAX passed\n'
+
+# Compare with the host compiler in two live Linux thread control blocks.
+cat > thread-pointer.c <<'C'
+void *native_thread_pointer(void) { return __builtin_thread_pointer(); }
+C
+cat > thread-pointer-main.c <<'C'
+#include <pthread.h>
+extern void *native_thread_pointer(void);
+static void *worker(void *parent) {
+    void *current = __builtin_thread_pointer();
+    return current && current != parent && native_thread_pointer() == current ? 0 : parent;
+}
+int main(void) {
+    pthread_t child;
+    void *result;
+    void *parent = __builtin_thread_pointer();
+    if (!parent || native_thread_pointer() != parent) return 1;
+    if (pthread_create(&child, 0, worker, parent)) return 2;
+    return pthread_join(child, &result) || result != 0;
+}
+C
+"$necc" -c thread-pointer.c -o thread-pointer.o
+"$cc" -std=c11 -O2 -pthread -no-pie thread-pointer-main.c thread-pointer.o -o thread-pointer
+./thread-pointer
+printf 'Linux x86-64 thread pointers matched in main and child threads\n'
