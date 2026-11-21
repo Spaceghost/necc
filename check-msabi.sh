@@ -10,6 +10,9 @@ cd "$out"
 
 cat > shared.h <<'C'
 #define MS __attribute__((ms_abi))
+#define PURE_MS __attribute__((__pure__, ms_abi))
+#define MS_PURE __attribute__((ms_abi, __pure__))
+#define REPEATED_PURE_MS __attribute__((pure)) __attribute__((ms_abi))
 typedef double (MS *Mixed)(int, double, long, float, double, int);
 typedef struct { Mixed callback; } Protocol;
 typedef struct { char bytes[3]; long number; double score; } Large;
@@ -22,6 +25,9 @@ long MS bridge(long);
 long verify_preserved(void);
 Large MS adjust(int, Large, double);
 Small MS increment(Small);
+long PURE_MS pure_before(long);
+long MS_PURE pure_reverse(long);
+long REPEATED_PURE_MS pure_repeated(long);
 C
 cat > functions.c <<'C'
 #include "shared.h"
@@ -29,6 +35,9 @@ double MS mixed(int a, double b, long c, float d, double e, int f) {
     return a + 2*b + 3*c + 4*d + 5*e + 6*f;
 }
 long MS bridge(long x) { return native_clobber(x) + 1; }
+long PURE_MS pure_before(long x) { return x + 42; }
+long MS_PURE pure_reverse(long x) { return x + 42; }
+long REPEATED_PURE_MS pure_repeated(long x) { return x + 42; }
 Large MS adjust(int n, Large v, double s) {
     v.bytes[1] += n;
     v.number += 11;
@@ -59,6 +68,7 @@ typedef struct { unsigned short v[128]; } Buffer;
 static Mixed get_callback(Protocol *p) { return p->callback; }
 int main(void) {
     double expected = 1 + 2*1.25 + 3*3 + 4*4.5 + 5*5.5 + 6*7;
+    if (pure_before(0) != 42 || pure_reverse(0) != 42 || pure_repeated(0) != 42) return 11;
     if (mixed(1,1.25,3,4.5f,5.5,7) != expected) return 1;
     if (get_callback(&protocol)(1,1.25,3,4.5f,5.5,7) != expected) return 2;
     if (slots(2,3,4,5,6,7) != 27) return 3;
@@ -162,7 +172,14 @@ if "$necc" -c wrong.c -o invalid.o 2>error; then exit 1; fi
 grep -q 'incompatible function pointer' error
 test ! -e invalid.o
 cat > wrong.c <<'C'
-int __attribute__((ms_abi)) off();
+int __attribute__((__pure__, ms_abi)) off();
+int off(int x) { return x; }
+C
+if "$necc" -c wrong.c -o invalid.o 2>error; then exit 1; fi
+grep -q 'conflicting declaration' error
+test ! -e invalid.o
+cat > wrong.c <<'C'
+int __attribute__((ms_abi, __pure__)) off();
 int off(int x) { return x; }
 C
 if "$necc" -c wrong.c -o invalid.o 2>error; then exit 1; fi

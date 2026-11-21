@@ -37,32 +37,37 @@ local function qualifier(s: string): boolean
   return s == 'const' or s == 'volatile' or s == 'restrict' or s == '__restrict' or s == '__restrict__'
 end
 
--- Return the recognized attribute and leave other attributes to the caller.
-local function function_attribute(c: *Cursor): string
-  if peek(c,0) ~= '__attribute__' and peek(c,0) ~= '__attribute' then return '' end
-  local at = c.at
+-- Consume only attributes whose effects the frontend either implements or
+-- can safely ignore. If any member of a GNU list is unsupported, leave the
+-- whole list for the declaration parser to reject.
+local function function_attribute(c: *Cursor, ms: *boolean): boolean
+  if peek(c,0) ~= '__attribute__' and peek(c,0) ~= '__attribute' then return false end
+  local at, previous_ms = c.at, $ms
   c.at = c.at + 1
-  if take(c, '(') and take(c, '(') then
+  local valid = take(c, '(') and take(c, '(')
+  while valid do
     local name = peek(c,0)
-    if name == 'ms_abi' or name == '__ms_abi__' or name == 'noreturn' or name == '__noreturn__' or
-        name == 'returns_twice' or name == '__returns_twice__' or name == 'pure' or name == '__pure__' or
-        name == 'const' or name == '__const__' then
+    local is_ms = name == 'ms_abi' or name == '__ms_abi__'
+    local supported = is_ms or name == 'noreturn' or name == '__noreturn__' or
+      name == 'returns_twice' or name == '__returns_twice__' or name == 'pure' or name == '__pure__' or
+      name == 'const' or name == '__const__'
+    if not supported then valid = false
+    else
+      if is_ms then $ms = true end
       c.at = c.at + 1
-      if take(c, ')') and take(c, ')') then return name end
+      if not take(c, ',') then break end
     end
   end
-  c.at = at
-  return ''
+  if valid then valid = take(c, ')') and take(c, ')') end
+  if valid then return true end
+  c.at, $ms = at, previous_ms
+  return false
 end
 
 local function attributes(c: *Cursor, ms: *boolean): boolean
   local consumed = false
-  while true do
-    local name = function_attribute(c)
-    if #name == 0 then return consumed end
-    if name == 'ms_abi' or name == '__ms_abi__' then $ms = true end
-    consumed = true
-  end
+  while function_attribute(c, ms) do consumed = true end
+  return consumed
 end
 
 local function builtin(s: string): boolean

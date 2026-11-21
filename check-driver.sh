@@ -102,6 +102,19 @@ int main(void) {
 C
 "$necc" attributes.c -o attributes
 ./attributes
+reject_attribute() {
+    name=$1
+    declaration=$2
+    printf '%s\n' "$declaration" > "$name.c"
+    if "$necc" -c "$name.c" -o "$name.o" 2> rejected; then
+        echo "unexpectedly accepted unsupported attribute in $name.c" >&2
+        exit 1
+    fi
+    test ! -e "$name.o"
+}
+reject_attribute weak 'int __attribute__((weak)) weakfn(void);'
+reject_attribute aligned 'int __attribute__((aligned(16))) aligned_object;'
+reject_attribute pure_weak 'int __attribute__((__pure__, weak)) mixed(int);'
 echo 'Multi-file native C, ordered static archives, GNU pure/const attributes, mixed Nelua/C, and atomic failed links passed'
 cat > bytes.c <<'C'
 const unsigned char table[3 + 2] = {0x41, 0377, 0x80};
