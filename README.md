@@ -161,3 +161,18 @@ The generated C files have stable names so object metadata is reproducible.
 Each archive member fits the staged archiver's 15-byte name limit. Two clean
 builds in separate output directories with the same source and tools produce
 identical archives.
+
+To compose the libc and runtime graphs, give each renderer a relative output
+prefix. The runtime link can then take the rebuilt archive as a graph input.
+Run this from an output directory with `NECC_SYSROOT` set to the seed SDK.
+
+```sh
+{
+  "$NECC" --lua "$NECC_SRC/render-libc.lua" "$NECC" "$NECC_SYSROOT" \
+    "$NELIBC_SRC" "$(command -v gcc)" libc
+  "$NECC" --lua "$NECC_SRC/render-lua.lua" "$NECC" "$NECC_SYSROOT" \
+    "$NELUA_SRC" runtime libc/libnelibc.a
+  printf 'default runtime/nelua-lua\n'
+} > build.ne
+"$NEBUILD" -j 4 build.ne
+```

@@ -1,6 +1,6 @@
 -- Generate the standalone x86-64 Nelibc archive from its original sources.
 local lfs = require 'lfs'
-assert(#arg == 4, 'usage: render-libc.lua NECC SYSROOT NELIBC_SRC X86_64_GCC')
+assert(#arg == 4 or #arg == 5, 'usage: render-libc.lua NECC SYSROOT NELIBC_SRC X86_64_GCC [OUTPUT_PREFIX]')
 
 local function absolute(path)
   if path:sub(1, 1) ~= '/' then path = lfs.currentdir() .. '/' .. path end
@@ -31,6 +31,14 @@ local function files(dir, pattern, list)
   end
 end
 
+local prefix = arg[5] and arg[5]:gsub('/+$', '') or ''
+assert(not arg[5] or (prefix ~= '' and prefix:sub(1, 1) ~= '/' and not prefix:find('%s')),
+  'output prefix must be a relative path without whitespace')
+
+local function output(name)
+  return prefix == '' and name or prefix .. '/' .. name
+end
+
 local function edge(target, inputs, recipe)
   local deps = {}
   for _, group in ipairs(inputs) do
@@ -42,6 +50,7 @@ local function edge(target, inputs, recipe)
   local ordered = {}
   for name in pairs(deps) do ordered[#ordered + 1] = name end
   table.sort(ordered)
+  if prefix ~= '' then recipe = 'mkdir -p ' .. quote(prefix) .. ' && ' .. recipe end
   io.write('build ', target, ' ', table.concat(ordered, ' '), '\n\t', recipe, '\n')
 end
 
@@ -67,9 +76,9 @@ local function stamp(name, inputs)
   edge(name, {inputs}, ': > ' .. quote(name))
   return {name}
 end
-local target_headers = stamp('target-headers.stamp', headers)
-local compiler_headers = stamp('gcc-headers.stamp', gcc_headers)
-local nelua_frontend = stamp('nelua-frontend.stamp', frontend)
+local target_headers = stamp(output('target-headers.stamp'), headers)
+local compiler_headers = stamp(output('gcc-headers.stamp'), gcc_headers)
+local nelua_frontend = stamp(output('nelua-frontend.stamp'), frontend)
 
 -- Keep the standalone TinyCC profile's archive order. Compiler runtime
 -- routines come from the SDK's separate libtcc1.a at executable link time.
@@ -141,7 +150,7 @@ for object, name in units:gmatch('(%S+)%s+(%S+)') do
   if is_nelua then
     -- A named intermediate keeps TinyCC's ELF FILE symbol independent of
     -- necc's private temporary directory on each invocation.
-    local generated = object .. '.c'
+    local generated = output(object .. '.c')
     edge(generated, {{source}, nelua_frontend}, 'NECC_SYSROOT=' .. quote(sdk) .. ' ' ..
       command({necc, '--release', '--emit-c', source, '-o', generated}))
     source = generated
@@ -151,16 +160,17 @@ for object, name in units:gmatch('(%S+)%s+(%S+)') do
       '-fno-tree-loop-distribute-patterns', '-ftls-model=local-exec', '-nostdinc', '-DNELIBC_STANDALONE',
       '-I' .. tree .. '/include', '-isystem', builtin, '-isystem', sdk .. '/uapi'}
     if name == 'memory_x86_64.S' then args[#args + 1] = '-DNELIBC_TCC_PUBLIC_MEMCPY' end
-    for _, word in ipairs({'-c', source, '-o', object}) do args[#args + 1] = word end
-    edge(object, {{source, gcc}, target_headers, compiler_headers}, command(args))
+    for _, word in ipairs({'-c', source, '-o', output(object)}) do args[#args + 1] = word end
+    edge(output(object), {{source, gcc}, target_headers, compiler_headers}, command(args))
   else
     local args = {tcc, '-B' .. sdk .. '/tcc', '-std=c11', '-ffreestanding', '-nostdinc', '-DNELIBC_STANDALONE',
       '-I' .. tree .. '/include', '-I' .. sdk .. '/include', '-I' .. sdk .. '/tcc/include', '-I' .. sdk .. '/uapi',
-      '-c', source, '-o', object}
-    edge(object, {{source, tcc}, target_headers}, command(args))
+      '-c', source, '-o', output(object)}
+    edge(output(object), {{source, tcc}, target_headers}, command(args))
   end
-  objects[#objects + 1] = object
+  objects[#objects + 1] = output(object)
 end
 
-edge('libnelibc.a', {{tcc}, objects}, command({tcc, '-ar', 'rcs', 'libnelibc.a', table.unpack(objects)}))
-print('default libnelibc.a')
+local archive = output('libnelibc.a')
+edge(archive, {{tcc}, objects}, command({tcc, '-ar', 'rcs', archive, table.unpack(objects)}))
+if prefix == '' then print('default ' .. archive) end
