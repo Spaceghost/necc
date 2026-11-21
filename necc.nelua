@@ -2005,6 +2005,38 @@ local function followed_by(w: string): boolean
   return found
 end
 
+-- Use a PC-relative table for dense switches such as interpreter dispatch.
+-- Keep short or sparse switches on the comparison path.
+local function dense_dispatch(s: *Switch, fallback: string): boolean
+  if #s.cases < 8 then return false end
+  local low, high = s.cases[1].n, s.cases[1].n
+  for i: usize=2,#s.cases do
+    local n = s.cases[i].n
+    if n < low then low = n elseif n > high then high = n end
+  end
+  local span = (@uint64)(high) - (@uint64)(low)
+  if span >= 2 * #s.cases or span >= 4096 then return false end
+  local targets: sequence(string)
+  defer targets:destroy() end
+  for i: usize=0,span do targets:push(fallback) end
+  for i: usize=1,#s.cases do
+    local index = (@uint64)(s.cases[i].n) - (@uint64)(low)
+    targets[index+1] = s.cases[i].target
+  end
+  if low ~= 0 then immediate(low); emit('subq %rax, %rcx') end
+  emit('cmpq $' .. tostring(span) .. ', %rcx')
+  emit('ja ' .. fallback)
+  local table_label = label()
+  emit('leaq ' .. table_label .. '(%rip), %rdx')
+  emit('movslq (%rdx,%rcx,4), %rax')
+  emit('addq %rdx, %rax')
+  emit('jmp *%rax')
+  emit('.balign 4')
+  emit(table_label .. ':')
+  for i: usize=1,#targets do emit('.long ' .. targets[i] .. '-' .. table_label) end
+  return true
+end
+
 local function switch_statement(ret: string)
   expect('(')
   local k=ct.promote(value(expression(1)).kind)
@@ -2020,10 +2052,12 @@ local function switch_statement(ret: string)
   s=switches:pop()
   emit('jmp ' .. done); emit(dispatch .. ':')
   emit('movq ' .. address(s.slot) .. ', %rcx')
-  for i: usize=1,#s.cases do
-    immediate(s.cases[i].n); emit('cmpq %rax, %rcx'); emit('je ' .. s.cases[i].target)
+  if not dense_dispatch(&s, #s.fallback > 0 and s.fallback or done) then
+    for i: usize=1,#s.cases do
+      immediate(s.cases[i].n); emit('cmpq %rax, %rcx'); emit('je ' .. s.cases[i].target)
+    end
+    if #s.fallback > 0 then emit('jmp ' .. s.fallback) end
   end
-  if #s.fallback > 0 then emit('jmp ' .. s.fallback) end
   emit(done .. ':')
   s.cases:destroy()
 end

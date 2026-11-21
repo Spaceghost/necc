@@ -56,6 +56,8 @@ check_c ./two
 check_c ./three
 "$necc" "$script_dir/tests/atomic_builtins.c" -o atomic-builtins
 ./atomic-builtins
+"$necc" "$script_dir/tests/dense_switch.c" -o dense-switch
+./dense-switch
 cat > atomic-bool.c <<'C'
 int main(void) { _Bool value = 0; return __atomic_load_n(&value, __ATOMIC_RELAXED); }
 C
