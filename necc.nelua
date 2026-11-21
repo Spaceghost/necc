@@ -1442,21 +1442,22 @@ local function floating_initializer(words: *ce.Tokens, k: Id): (integer,uint64,u
     local sign = ($words)[first]
     if sign == '+' or sign == '-' then first = first + 1 end
     if first == last and fp.token(($words)[first]) then
-      if k == Kind.LongDouble and ($words)[first]:sub(-1):lower() == 'l' then
+      local suffix = ($words)[first]:byte(-1)
+      if suffix == 76 or suffix == 108 then
         local significand,sign_exponent,from=fp.literal_long_double(($words)[first])
         if from == Kind.Unknown then fail('invalid floating initializer') end
         if sign == '-' then sign_exponent=sign_exponent ~ 0x8000 end
-        return 0,significand,sign_exponent
+        return fp.constant(0,significand,sign_exponent,from,k)
       end
       local bits, from = fp.literal(($words)[first])
       if from == Kind.Unknown then fail('invalid floating initializer') end
       if sign == '-' then bits = bits ~ (from == Kind.Float and 0x80000000 or (-9223372036854775807-1)) end
-      return fp.convert(bits, from, k),0,0
+      return fp.constant(bits,0,0,from,k)
     end
   end
   local n, ok, from = ce.evaluate(words, &enumerators, &aliases)
   if not ok then fail('unsupported floating constant expression') end
-  return fp.convert(n, from, k),0,0
+  return fp.constant(n,0,0,from,k)
 end
 
 local InitializerTarget = @record{kind: Id, offset: integer, index: integer}

@@ -21,7 +21,10 @@ long double gcc_long_double_add(long double left, long double right) {
   return left + right;
 }
 
+extern int necc_static_floats(void);
+
 int main(void) {
+  if (!necc_static_floats()) return 32;
   if (necc_long_double_make(9007199254740993LL) != 9007199254740993.0L) return 1;
   if (necc_long_double_make_unsigned(0x8000000000000001ULL) != 9223372036854775809.0L) return 15;
   if (necc_long_double_make_unsigned(0xffffffffffffffffULL) != 18446744073709551615.0L) return 16;

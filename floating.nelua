@@ -86,4 +86,25 @@ function fp.convert(bits: integer, from: ct.Id, into: ct.Id): integer
   return (@integer)(d.bits)
 end
 
+-- Static initializers undergo the conversion to the declared object type.
+function fp.constant(bits: integer, significand: uint64, sign_exponent: uint16,
+                     from: ct.Id, into: ct.Id): (integer,uint64,uint16)
+  if from ~= K.LongDouble and into ~= K.LongDouble then return fp.convert(bits,from,into),0,0 end
+  local ext: ExtendedBits
+  local f: FloatBits
+  local d: DoubleBits
+  if from == K.LongDouble then
+    ext.parts.significand, ext.parts.sign_exponent = significand, sign_exponent
+  elseif from == K.Float then f.bits=(@uint32)(bits); ext.d=f.f
+  elseif from == K.Double then d.bits=(@uint64)(bits); ext.d=d.d
+  else
+    ext.d=(@clongdouble)(bits)
+    if ct.unsigned(from) and bits < 0 then ext.d=ext.d+0x1p64 end
+  end
+  if into == K.LongDouble then return 0,ext.parts.significand,ext.parts.sign_exponent end
+  if into == K.Float then f.f=(@float32)(ext.d); return (@integer)(f.bits),0,0 end
+  d.d=(@float64)(ext.d)
+  return (@integer)(d.bits),0,0
+end
+
 return fp

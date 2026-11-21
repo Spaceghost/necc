@@ -70,3 +70,16 @@ long double necc_long_double_after_six_gp(int a, int b, int c, int d, int e, int
                                           long double value) {
   return value + (long double)(a + b + c + d + e + f);
 }
+
+static long double from_integer = 3 * 7;
+static long double from_unsigned = 18446744073709551615ULL;
+static long double from_double = 1.0000000000000000001;
+static long double from_single = -1.5f;
+static double narrowed = 0x1.0000000000000002p0L;
+static float narrowed_negative = -1.5L;
+
+int necc_static_floats(void) {
+  return from_integer == 21.0L && from_unsigned == 0xffffffffffffffffp0L &&
+         from_double == 1.0L && from_single == -1.5L &&
+         narrowed == 1.0 && narrowed_negative == -1.5f;
+}
