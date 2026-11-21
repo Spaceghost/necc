@@ -1,0 +1,261 @@
+-- Parse C declaration specifiers and declarators from preprocessed source.
+-- Keep incomplete tags available to pointers when a header uses layout
+-- features outside the supported ABI.
+require 'hashmap'
+require 'sequence'
+require 'string'
+local ct = require 'ctypes'
+local ce = require 'consteval'
+local h = @record{}
+local Id, K = ct.Id, ct.Kind
+global h.Tokens = @sequence(string)
+global h.Aliases = ct.Aliases
+global h.Parameter = @record{name: string, kind: Id}
+global h.Parameters = @sequence(h.Parameter)
+global h.Declaration = @record{
+  name: string, kind: Id, params: h.Parameters, internal: boolean, external: boolean,
+  is_typedef: boolean, readonly: boolean, spec_count: usize
+}
+local Cursor = @record{words: *h.Tokens, at: usize, last: usize, aliases: *h.Aliases, enums: *ce.Names}
+local Specs = @record{kind: Id, internal: boolean, external: boolean, is_typedef: boolean, readonly: boolean}
+local OpKind = @enum{Pointer=0, Array, Function}
+local Op = @record{form: OpKind, count: integer, sig: ct.Signature, params: h.Parameters}
+local Ops = @sequence(Op)
+
+local function peek(c: *Cursor, ahead: usize): string
+  if c.at+ahead > c.last then return '' end
+  return ($c.words)[c.at+ahead]
+end
+
+local function take(c: *Cursor, s: string): boolean
+  if peek(c,0) ~= s then return false end
+  c.at = c.at+1
+  return true
+end
+
+local function qualifier(s: string): boolean
+  return s == 'const' or s == 'volatile' or s == 'restrict' or s == '__restrict' or s == '__restrict__'
+end
+
+-- Consume the function attributes that leave the target's calling convention and layout intact.
+local function function_attribute(c: *Cursor): boolean
+  if peek(c,0) ~= '__attribute__' and peek(c,0) ~= '__attribute' then return false end
+  local at = c.at
+  c.at = c.at + 1
+  if take(c, '(') and take(c, '(') and
+      (take(c, '__noreturn__') or take(c, 'noreturn') or take(c, '__returns_twice__') or take(c, 'returns_twice')) and
+      take(c, ')') and take(c, ')') then return true end
+  c.at = at
+  return false
+end
+
+local function builtin(s: string): boolean
+  return s == 'void' or s == '_Bool' or s == 'signed' or s == 'unsigned' or s == 'char' or
+    s == 'short' or s == 'int' or s == 'long' or s == 'float' or s == 'double'
+end
+
+function h.starts_type(s: string, aliases: *h.Aliases): boolean
+  return builtin(s) or qualifier(s) or s == 'struct' or s == 'union' or s == 'enum' or ($aliases):has(s)
+end
+
+local function identifier(s: string): boolean
+  if #s == 0 then return false end
+  local b = s:byte(1)
+  return (b == 95 or (b >= 65 and b <= 90) or (b >= 97 and b <= 122)) and
+    not builtin(s) and not qualifier(s) and s ~= 'struct' and s ~= 'union' and s ~= 'enum' and
+    s ~= 'double' and s ~= 'float' and s ~= '_Complex' and s ~= '_Atomic'
+end
+
+local function specifiers(c: *Cursor): Specs <forwarddecl> end
+local function declaration(c: *Cursor, base: Id): h.Declaration <forwarddecl> end
+
+local function record_type(c: *Cursor, word: string): Id
+  local name: string
+  if identifier(peek(c,0)) then name = peek(c,0); c.at = c.at+1 end
+  if #name == 0 and peek(c,0) ~= '{' then return K.Unknown end
+  local id = ct.tag(word,name)
+  if not take(c,'{') then return id end
+  local fields: Cursor = {words=c.words, at=c.at, aliases=c.aliases, enums=c.enums}
+  local depth: integer = 1
+  while depth > 0 and c.at <= c.last do
+    local w = peek(c,0)
+    c.at = c.at+1
+    if w == '{' then depth = depth+1 elseif w == '}' then depth = depth-1 end
+  end
+  if depth ~= 0 then return K.Unknown end
+  fields.last = c.at-2
+  local members: ct.Members
+  local names: hashmap(string, boolean)
+  while fields.at <= fields.last do
+    local spec = specifiers(&fields)
+    if spec.kind == K.Unknown then return id end
+    repeat
+      local d = declaration(&fields,spec.kind)
+      if d.kind == K.Unknown then return id end
+      if #d.name == 0 then
+        if not ct.is_record(d.kind) then return id end
+      else
+        if names[d.name] then return id end
+        names[d.name] = true
+      end
+      members:push({name=d.name,kind=d.kind})
+    until not take(&fields,',')
+    if not take(&fields,';') then return id end
+  end
+  ct.complete(id,&members)
+  return id
+end
+
+function specifiers(c: *Cursor): Specs
+  local result: Specs
+  local sign, longs: integer = 0, 0
+  local base: string
+  local short = false
+  while c.at <= c.last do
+    local w = peek(c,0)
+    if take(c,'typedef') then result.is_typedef = true
+    elseif take(c,'extern') then result.external = true
+    elseif take(c,'static') then result.internal = true
+    elseif function_attribute(c) then
+    elseif take(c,'inline') or take(c,'register') or take(c,'_Noreturn') then
+    elseif qualifier(w) then
+      if w == 'const' then result.readonly = true end
+      c.at = c.at+1
+    elseif w == 'struct' or w == 'union' then
+      if #base > 0 or result.kind ~= K.Unknown or sign ~= 0 or short or longs > 0 then break end
+      c.at = c.at+1
+      result.kind = record_type(c,w)
+      if result.kind == K.Unknown then return result end
+    elseif ($c.aliases):has(w) and result.kind == K.Unknown and #base == 0 and sign == 0 and longs == 0 and not short then
+      result.kind = ($c.aliases)[w]; c.at = c.at+1
+    elseif builtin(w) and result.kind == K.Unknown then
+      c.at = c.at+1
+      if w == 'signed' or w == 'unsigned' then
+        if sign ~= 0 then return {} end
+        sign = w == 'unsigned' and 1 or -1
+      elseif w == 'short' then
+        if short then return {} end
+        short = true
+      elseif w == 'long' then
+        longs = longs+1
+      else
+        if #base ~= 0 then return {} end
+        base = w
+      end
+    else break end
+  end
+  if result.kind ~= K.Unknown then return result end
+  if base == 'float' or base == 'double' then
+    if sign ~= 0 or short or longs > 1 or (base == 'float' and longs ~= 0) then return {} end
+    result.kind = base == 'float' and K.Float or (longs == 1 and K.LongDouble or K.Double)
+  elseif base == 'void' or base == '_Bool' then
+    if sign == 0 and not short and longs == 0 then result.kind = base == 'void' and K.Void or K.Bool end
+  elseif base == 'char' then
+    if not short and longs == 0 then result.kind = sign == 1 and K.UChar or (sign == -1 and K.SChar or K.Char) end
+  elseif base == 'int' or short or longs ~= 0 or sign ~= 0 then
+    if longs > 2 or (short and longs ~= 0) then return {} end
+    if short then result.kind = sign == 1 and K.UShort or K.Short
+    elseif longs == 2 then result.kind = sign == 1 and K.ULLong or K.LLong
+    elseif longs == 1 then result.kind = sign == 1 and K.ULong or K.Long
+    else result.kind = sign == 1 and K.UInt or K.Int end
+  end
+  return result
+end
+
+local function declarator(c: *Cursor, ops: *Ops, name: *string): boolean
+  local stars: integer = 0
+  while take(c,'*') do
+    stars = stars+1
+    while qualifier(peek(c,0)) do c.at = c.at+1 end
+  end
+  if peek(c,0) == '(' and peek(c,1) ~= ')' and not h.starts_type(peek(c,1),c.aliases) then
+    c.at = c.at+1
+    if not declarator(c,ops,name) or not take(c,')') then return false end
+  elseif identifier(peek(c,0)) then
+    $name = peek(c,0); c.at = c.at+1
+  end
+  while true do
+    if take(c,'[') then
+      local words: ce.Tokens
+      while c.at <= c.last and peek(c,0) ~= ']' do words:push(peek(c,0)); c.at = c.at+1 end
+      if not take(c,']') then return false end
+      local count: integer = 0
+      if #words ~= 0 then
+        local n, ok = ce.evaluate(&words, c.enums, c.aliases)
+        if not ok or n <= 0 then return false end
+        count = n
+      end
+      ops:push({form=OpKind.Array,count=count})
+    elseif take(c,'(') then
+      local op: Op = {form=OpKind.Function}
+      if take(c,')') then op.sig.unspecified = true
+      elseif peek(c,0) == 'void' and peek(c,1) == ')' then c.at = c.at+2
+      else
+        repeat
+          if take(c,'...') then
+            if op.sig.arity == 0 then return false end
+            op.sig.variadic = true
+            break
+          end
+          local spec = specifiers(c)
+          if spec.kind == K.Unknown then return false end
+          local arg = declaration(c,spec.kind)
+          local k = arg.kind
+          if k == K.Unknown or k == K.Void then return false end
+          if ct.is_array(k) then k = ct.pointer(ct.element(k))
+          elseif ct.is_function(k) then k = ct.pointer(k) end
+          op.params:push({name=arg.name,kind=k})
+          op.sig.parameters:push(k)
+          op.sig.arity = op.sig.arity+1
+        until not take(c,',')
+        if not take(c,')') then return false end
+      end
+      ops:push(op)
+    else break end
+  end
+  for i = 1, stars do ops:push({form=OpKind.Pointer}) end
+  return true
+end
+
+function declaration(c: *Cursor, base: Id): h.Declaration
+  local result: h.Declaration
+  local ops: Ops
+  if not declarator(c,&ops,&result.name) then return {} end
+  result.kind = base
+  for i = (@integer)(#ops), 1, -1 do
+    local op = ops[i]
+    if op.form == OpKind.Pointer then result.kind = ct.pointer(result.kind)
+    elseif op.form == OpKind.Array then result.kind = ct.array(result.kind,op.count)
+    else
+      if ct.is_array(result.kind) or ct.is_function(result.kind) then return {} end
+      op.sig.result = result.kind
+      result.kind = ct.function_type(op.sig)
+      if i == 1 then result.params = op.params end
+    end
+    if result.kind == K.Unknown then return {} end
+  end
+  return result
+end
+
+function h.parse(words: *h.Tokens, aliases: *h.Aliases, enums: *ce.Names): h.Declaration
+  local c: Cursor = {words=words, at=1, last=#($words), aliases=aliases, enums=enums}
+  local spec = specifiers(&c)
+  if spec.kind == K.Unknown then return {} end
+  local count=c.at-1
+  local d = declaration(&c,spec.kind)
+  d.spec_count=count
+  while function_attribute(&c) do end
+  if c.at <= c.last then return {} end
+  d.internal, d.external, d.is_typedef, d.readonly = spec.internal, spec.external, spec.is_typedef, spec.readonly
+  return d
+end
+
+local function type_name(words: *ce.Tokens, aliases: *ct.Aliases, names: *ce.Names): Id
+  if #($words) == 0 or not h.starts_type(($words)[1], aliases) then return K.Unknown end
+  local d = h.parse(words, aliases, names)
+  if #d.name > 0 or d.is_typedef or d.internal or d.external then return K.Unknown end
+  return d.kind
+end
+ce.resolve_type = type_name
+
+return h

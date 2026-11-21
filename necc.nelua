@@ -1,0 +1,1755 @@
+-- Compile C to x86-64 System V assembly for the standalone Nelibc SDK.
+## pragmas.nogc = true
+
+require 'smallalloc'
+require 'arg'
+local driver = require 'driver'
+local headers = require 'headers'
+local ct = require 'ctypes'
+local fp = require 'floating'
+local leaf = require 'leaf'
+local sse = require 'sse'
+local ce = require 'consteval'
+require 'hashmap'
+require 'io'
+require 'os'
+require 'sequence'
+require 'string'
+require 'stringbuilder'
+require 'memory'
+
+local header_roots: *sequence(string)
+local source: string
+local source_path: string
+local offset: isize = 1
+local line: integer = 1
+local token_line: integer = 1
+local token: string
+local qualified_storage: boolean
+local Kind, Id = ct.Kind, ct.Id
+local aliases: headers.Aliases
+local enumerators: ce.Names
+local inside_header: boolean
+local sdk = os.getenv('NECC_SYSROOT')
+if #sdk == 0 then sdk = '/usr/lib/necc' end
+local Variable = @record{slot: integer, kind: Id, level: integer, symbol: string,
+                         readonly: boolean, internal: boolean, defined: boolean, tentative: boolean}
+local Binding = @record{name: string, previous: Variable}
+local bindings: sequence(Binding)
+local variables: hashmap(string, Variable)
+local locals: hashmap(string, Variable)
+local functions: hashmap(string, ct.Signature)
+local data: sequence(string)
+local rodata: sequence(string)
+local constants: sequence(string)
+local scope: integer = 1
+local function_result: Id
+local break_to: string
+local continue_to: string
+local assembly: sequence(string)
+local body: sequence(string)
+local slots: integer
+local depth: integer
+local label_count: integer
+local wide_registers: []string = {'%rdi', '%rsi', '%rdx', '%rcx', '%r8', '%r9'}
+
+local function fail(message: string): void <noreturn>
+  io.stderr:write('necc: ' .. source_path .. ':' .. tostring(token_line) .. ': ' .. message .. '\n')
+  driver.finish(1)
+end
+
+local function source_byte(position: isize): byte
+  if position < 1 or position > (@isize)(#source) then return 0 end
+  return source.data[position-1]
+end
+
+local function letter(c: byte): boolean
+  return (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95
+end
+
+local function digit(c: byte): boolean
+  return c >= 48 and c <= 57
+end
+
+local sdk_prefix=sdk .. '/'
+local function horizontal(c: byte): boolean
+  return c==32 or (c>=9 and c<=13)
+end
+
+local function preprocessor_line()
+  local first=offset
+  local stop=(@isize)(#source)+1
+  local newline=memory.scan(&source.data[first-1],10,(@usize)(stop-first))
+  if newline~=nilptr then stop=(@isize)(newline)-(@isize)(source.data)+1 end
+  offset=stop+1
+  local i=first+1
+  while i<stop and horizontal(source.data[i-1]) do i=i+1 end
+  if i>=stop or not digit(source.data[i-1]) then
+    if source:subview(first,first+6)~='#pragma' then fail('expected a preprocessed C line marker') end
+    line=line+1
+    return
+  end
+  local nextline: integer=0
+  while i<stop and digit(source.data[i-1]) do
+    local d=source.data[i-1]-48
+    if nextline>(9223372036854775807-d)//10 then fail('line marker exceeds integer range') end
+    nextline=nextline*10+d; i=i+1
+  end
+  if i>=stop or not horizontal(source.data[i-1]) then fail('expected a preprocessed C line marker') end
+  while i<stop and horizontal(source.data[i-1]) do i=i+1 end
+  local last=stop-1
+  while last>i and source.data[last-1]~=34 do last=last-1 end
+  if i>=last or source.data[i-1]~=34 then fail('expected a preprocessed C line marker') end
+  line=nextline
+  source_path=source:subview(i+1,last-1)
+  inside_header=source_path:subview(1,#sdk_prefix)==sdk_prefix
+  if inside_header then
+    local relative=source_path:subview(#sdk_prefix+1)
+    inside_header=relative:subview(1,8)=='include/' or relative:subview(1,12)=='tcc/include/' or relative:subview(1,5)=='uapi/'
+  end
+  if not inside_header and source_path:subview(-2)=='.h' then
+    for k: usize=1,#($header_roots) do
+      local root=($header_roots)[k]
+      if source_path:subview(1,#root)==root and
+          (root:subview(-1)=='/' or source_path:subview(#root+1,#root+1)=='/') then
+        inside_header=true; break
+      end
+    end
+  end
+end
+
+local function next_token()
+  while offset <= (@isize)(#source) do
+    local c = source_byte(offset)
+    if c == 35 then
+      preprocessor_line()
+    elseif c == 32 or (c >= 9 and c <= 13) then
+      if c == 10 then line = line + 1 end
+      offset = offset + 1
+    elseif c == 47 and source_byte(offset + 1) == 47 then
+      repeat offset = offset + 1 until source_byte(offset) == 0 or source_byte(offset) == 10
+    elseif c == 47 and source_byte(offset + 1) == 42 then
+      token_line = line
+      offset = offset + 2
+      while source_byte(offset) ~= 42 or source_byte(offset + 1) ~= 47 do
+        if source_byte(offset) == 0 then fail('unterminated comment') end
+        if source_byte(offset) == 10 then line = line + 1 end
+        offset = offset + 1
+      end
+      offset = offset + 2
+    else
+      break
+    end
+  end
+  token_line = line
+  if offset > (@isize)(#source) then
+    token = ''
+    return
+  end
+  local first = offset
+  local c = source_byte(offset)
+  offset = offset + 1
+  if c == 34 or c == 39 then
+    while source_byte(offset) ~= c do
+      if source_byte(offset) == 92 then offset = offset + 1 end
+      if source_byte(offset) == 0 or source_byte(offset) == 10 then fail('unterminated literal') end
+      offset = offset + 1
+    end
+    offset = offset + 1
+  elseif digit(c) or (c == 46 and digit(source_byte(offset))) then
+    while true do
+      local ch=source_byte(offset)
+      local prev=source_byte(offset-1)
+      if letter(ch) or digit(ch) or ch == 46 or
+          ((ch == 43 or ch == 45) and (prev == 69 or prev == 101 or prev == 80 or prev == 112)) then
+        offset=offset+1
+      else break end
+    end
+  elseif letter(c) then
+    while letter(source_byte(offset)) or digit(source_byte(offset)) do offset=offset+1 end
+  else
+    local three = source:subview(first,first+2)
+    local two = source:subview(first,first+1)
+    if three == '...' or three == '<<=' or three == '>>=' then offset = first+3
+    elseif two == '->' or two == '++' or two == '--' or two == '&&' or two == '||' or
+        two == '<<' or two == '>>' or two == '==' or two == '!=' or two == '<=' or two == '>=' or
+        two == '+=' or two == '-=' or two == '*=' or two == '/=' or two == '%=' or
+        two == '&=' or two == '|=' or two == '^=' then
+      offset = first+2
+    end
+  end
+  token = source:subview(first, offset - 1)
+  -- Declaration parsing strips qualifiers. Preserve memory access for
+  -- volatile or atomic storage, including through previously seen typedefs.
+  if token=='volatile' or token=='_Atomic' or token=='__volatile' or token=='__volatile__' then qualified_storage=true end
+end
+
+local function take(expected: string): boolean
+  if token ~= expected then return false end
+  next_token()
+  return true
+end
+
+local function expect(expected: string)
+  if not take(expected) then fail("expected '" .. expected .. "', got '" .. token .. "'") end
+end
+
+local keywords: []string = {
+  'auto', 'break', 'case', 'char', 'const', 'continue', 'default', 'do',
+  'double', 'else', 'enum', 'extern', 'float', 'for', 'goto', 'if', 'inline',
+  'int', 'long', 'register', 'restrict', 'return', 'short', 'signed', 'sizeof',
+  'static', 'struct', 'switch', 'typedef', 'union', 'unsigned', 'void',
+  'volatile', 'while', '_Alignas', '_Alignof', '_Atomic', '_Bool',
+  '_Complex', '_Generic', '_Imaginary', '_Noreturn', '_Static_assert', '_Thread_local'
+}
+
+local function allowed_name(name: string): boolean
+  if #name == 0 or not letter(name:byte(1)) then return false end
+  for index: usize = 0, #keywords - 1 do
+    if name == keywords[index] then return false end
+  end
+  return true
+end
+
+local function identifier(): string
+  if not allowed_name(token) then fail('expected identifier') end
+  local name = token
+  next_token()
+  return name
+end
+
+local function emit(instruction: string)
+  body:push('  ' .. instruction)
+end
+
+local function label(): string
+  label_count = label_count+1
+  return '.Lnecc_' .. tostring(label_count)
+end
+
+local function address(slot: integer): string
+  return tostring(-slot) .. '(%rbp)'
+end
+
+local function bind_local(name: string, v: Variable): Variable
+  if locals[name].level == scope then fail('duplicate local ' .. name) end
+  bindings:push({name=name,previous=locals[name]})
+  v.level=scope
+  locals[name]=v
+  return v
+end
+
+local function reserve(k: Id): integer
+  local size,alignment=ct.size(k),ct.align(k)
+  if size <= 0 or alignment <= 0 then fail('incomplete object type') end
+  if alignment < 8 then alignment=8 end
+  slots=((slots+size+alignment-1)//alignment)*alignment
+  return slots
+end
+
+local function allocate(name: string,k: Id,readonly: boolean): Variable
+  return bind_local(name,{slot=reserve(k),kind=k,readonly=readonly})
+end
+
+local function leave_scope(mark: usize)
+  while #bindings > mark do
+    local saved = bindings:pop()
+    locals[saved.name] = saved.previous
+  end
+end
+
+local function push_result()
+  emit('pushq %rax'); depth = depth+1
+end
+
+local function pop_result(reg: string)
+  emit('popq ' .. reg); depth = depth-1
+end
+
+local function normalize(k: Id)
+  if k == Kind.Char or k == Kind.SChar then emit('movsbq %al, %rax')
+  elseif k == Kind.Bool or k == Kind.UChar then emit('movzbl %al, %eax')
+  elseif k == Kind.Short then emit('movswq %ax, %rax')
+  elseif k == Kind.UShort then emit('movzwl %ax, %eax')
+  elseif k == Kind.Int then emit('movslq %eax, %rax')
+  elseif k == Kind.UInt then emit('movl %eax, %eax') end
+end
+
+local function load_memory(k: Id, place: string)
+  local n = ct.size(k)
+  if n == 1 then emit((ct.unsigned(k) and 'movzbq ' or 'movsbq ') .. place .. ', %rax')
+  elseif n == 2 then emit((ct.unsigned(k) and 'movzwq ' or 'movswq ') .. place .. ', %rax')
+  elseif n == 4 then emit((ct.unsigned(k) and 'movl ' or 'movslq ') .. place .. (ct.unsigned(k) and ', %eax' or ', %rax'))
+  elseif n == 8 then emit('movq ' .. place .. ', %rax')
+  else fail('unsupported scalar load') end
+end
+
+local function store_memory(k: Id, place: string)
+  local n = ct.size(k)
+  if n == 1 then emit('movb %al, ' .. place)
+  elseif n == 2 then emit('movw %ax, ' .. place)
+  elseif n == 4 then emit('movl %eax, ' .. place)
+  elseif n == 8 then emit('movq %rax, ' .. place)
+  else fail('unsupported scalar store') end
+end
+
+local function immediate(n: integer)
+  if n >= 0 and n <= 4294967295 then emit('movl $' .. tostring(n) .. ', %eax')
+  else emit('movq $' .. tostring(n) .. ', %rax') end
+end
+
+local function read_type(): Id
+  local words: headers.Tokens
+  local nest: integer = 0
+  while #token > 0 and (token ~= ')' or nest > 0) do
+    if token == '(' then nest = nest+1 elseif token == ')' then nest = nest-1 end
+    words:push(token); next_token()
+  end
+  expect(')')
+  local d = headers.parse(&words,&aliases,&enumerators)
+  words:destroy()
+  if d.kind == Kind.Unknown or #d.name ~= 0 then fail('invalid type name') end
+  return d.kind
+end
+
+local function literal_bytes(s: string, bytes: *sequence(byte))
+  local diagnostic=ce.bytes(s,bytes)
+  if #diagnostic > 0 then fail(diagnostic) end
+end
+
+local function strings(): sequence(byte)
+  local bytes: sequence(byte)
+  repeat literal_bytes(token,&bytes); next_token() until #token == 0 or token:byte(1) ~= 34
+  bytes:push(0)
+  return bytes
+end
+
+local function string_symbol(bytes: *sequence(byte)): string
+  local name = label()
+  constants:push(name .. ':')
+  for i: usize = 1, #($bytes) do constants:push('  .byte ' .. tostring(($bytes)[i])) end
+  return name
+end
+
+local Expr = @record{kind: Id, lvalue: boolean, readonly: boolean, null_constant: boolean, symbol: string,
+                     place: string, mark: usize, literal: boolean, number: integer, cc: string}
+local function scalar(k: Id): boolean return ct.is_integer(k) or ct.is_pointer(k) or ct.floating(k) end
+
+-- An lvalue leaves its address in RAX. Load only when the context needs its value.
+local function value(e: Expr): Expr
+  if ct.is_function(e.kind) then
+    if #e.symbol > 0 then emit('leaq ' .. e.symbol .. '(%rip), %rax') end
+    return {kind=ct.pointer(e.kind)}
+  elseif ct.is_array(e.kind) then
+    return {kind=ct.pointer(ct.element(e.kind))}
+  elseif e.lvalue then
+    if ct.is_record(e.kind) then return {kind=e.kind} end
+    if not scalar(e.kind) then fail('unsupported object value') end
+    if #e.place>0 and #body==e.mark then
+      body:pop()
+      load_memory(e.kind,e.place)
+      return {kind=e.kind,place=e.place,mark=#body}
+    end
+    load_memory(e.kind,'(%rax)')
+    return {kind=e.kind}
+  end
+  return e
+end
+
+local function compatible_pointer(a: Id,b: Id): boolean
+  if a == b then return true end
+  local x,y = ct.element(a),ct.element(b)
+  return (x == Kind.Void and not ct.is_function(y)) or (y == Kind.Void and not ct.is_function(x))
+end
+
+local function xmm_in(k: Id,reg: string)
+  emit((k == Kind.Float and 'movd %eax, ' or 'movq %rax, ') .. reg)
+end
+local function xmm_out(k: Id,reg: string)
+  emit((k == Kind.Float and 'movd ' or 'movq ') .. reg .. (k == Kind.Float and ', %eax' or ', %rax'))
+end
+
+local function truth(k: Id)
+  if ct.floating(k) then
+    xmm_in(k,'%xmm0'); emit('pxor %xmm1, %xmm1')
+    emit(sse.compare(k, 1, 0))
+    emit('setne %al'); emit('setp %dl'); emit('orb %dl, %al'); emit('movzbl %al, %eax')
+  else emit('testq %rax, %rax'); emit('setne %al'); emit('movzbl %al, %eax') end
+end
+
+local function numeric_conversion(from: Id,into: Id)
+  if from == into then return end
+  if ct.floating(into) then
+    if ct.floating(from) then
+      xmm_in(from,'%xmm0'); emit(sse.convert(from, into))
+    elseif ct.unsigned(from) and ct.size(from) == 8 then
+      local low,done=label(),label()
+      emit('testq %rax, %rax'); emit('jns ' .. low)
+      emit('movq %rax, %rdx'); emit('andl $1, %edx'); emit('shrq $1, %rax'); emit('orq %rdx, %rax')
+      emit(sse.convert(Kind.Long, into)); emit(sse.arithmetic(into, 'add', 0, 0))
+      emit('jmp ' .. done); emit(low .. ':'); emit(sse.convert(Kind.Long, into)); emit(done .. ':')
+    else emit(sse.convert(Kind.Long, into)) end
+    xmm_out(into,'%xmm0')
+  elseif ct.floating(from) then
+    xmm_in(from,'%xmm0')
+    if ct.unsigned(into) and ct.size(into) == 8 then
+      if from == Kind.Float then emit(sse.convert(Kind.Float, Kind.Double)) end
+      local low,done=label(),label()
+      immediate(0x43e0000000000000); emit('movq %rax, %xmm1') -- 2^63
+      emit(sse.compare(Kind.Double, 1, 0)); emit('jb ' .. low)
+      emit(sse.arithmetic(Kind.Double, 'sub', 1, 0)); emit(sse.convert(Kind.Double, Kind.Long)); emit('btcq $63, %rax')
+      emit('jmp ' .. done); emit(low .. ':'); emit(sse.convert(Kind.Double, Kind.Long)); emit(done .. ':')
+    else emit(sse.convert(from, Kind.Long)) end
+    normalize(into)
+  else normalize(into) end
+end
+
+local function convert(e: Expr,k: Id,cast: boolean): Expr
+  e=value(e)
+  if k == Kind.Void and cast then return {kind=k} end
+  if not scalar(e.kind) or not scalar(k) then fail('unsupported scalar conversion') end
+  if k == Kind.Bool then truth(e.kind)
+  elseif ct.is_pointer(k) then
+    if ct.floating(e.kind) or (not cast and not e.null_constant and
+        (not ct.is_pointer(e.kind) or not compatible_pointer(k,e.kind))) then fail('incompatible pointer conversion') end
+  elseif ct.is_pointer(e.kind) then
+    if not cast or ct.floating(k) then fail('incompatible pointer conversion') end
+    normalize(k)
+  else numeric_conversion(e.kind,k) end
+  return {kind=k,null_constant=e.null_constant and (ct.is_integer(k) or k == ct.pointer(Kind.Void))}
+end
+
+local function writable(e: Expr)
+  if not e.lvalue or e.readonly or not scalar(e.kind) then fail('expected a modifiable scalar lvalue') end
+end
+
+-- The right-hand record address is in RAX and the destination address in RDX.
+local function copy_record(target: Id, source_kind: Id)
+  if target ~= source_kind or ct.size(target) == 0 then fail('incompatible record assignment') end
+  emit('movq %rax, %rsi')
+  emit('movq %rdx, %rdi')
+  emit('movq $' .. tostring(ct.size(target)) .. ', %rcx')
+  emit('rep movsb')
+  emit('movq %rdx, %rax')
+end
+
+local function step(k: Id): integer
+  local n=ct.size(ct.element(k))
+  if n <= 0 then fail('pointer arithmetic needs a complete object type') end
+  return n
+end
+
+local function change(e: Expr, up: boolean, postfix: boolean): Expr
+  writable(e)
+  emit('movq %rax, %rcx'); load_memory(e.kind,'(%rcx)')
+  if postfix then emit('movq %rax, %r10') end
+  if ct.floating(e.kind) then
+    xmm_in(e.kind, '%xmm0')
+    immediate(e.kind == Kind.Float and 0x3f800000 or 0x3ff0000000000000)
+    xmm_in(e.kind, '%xmm1')
+    emit(sse.arithmetic(e.kind, up and 'add' or 'sub', 1, 0))
+    xmm_out(e.kind, '%xmm0')
+  else
+    local stride = ct.is_pointer(e.kind) and step(e.kind) or 1
+    emit((up and 'addq $' or 'subq $') .. tostring(stride) .. ', %rax')
+    if e.kind == Kind.Bool then truth(e.kind) else normalize(e.kind) end
+  end
+  store_memory(e.kind, '(%rcx)')
+  if postfix then emit('movq %r10, %rax') end
+  return {kind=e.kind}
+end
+
+local function condition(e: Expr)
+  e=value(e)
+  if not scalar(e.kind) then fail('condition must be scalar') end
+  if ct.floating(e.kind) then truth(e.kind) end
+  emit('testq %rax, %rax')
+end
+
+local function expression(minimum: integer): Expr <forwarddecl> end
+local function unary(): Expr <forwarddecl> end
+
+local function local_init(k: Id, slot: integer) <forwarddecl> end
+
+local function zero_local(k: Id, slot: integer)
+  for off = 0, ct.size(k)-1, 8 do emit('movq $0, ' .. address(slot-off)) end
+end
+
+local Placement = @record{kind: Id, reg: integer}
+local Abi = @record{gp: integer, sse: integer, stack: integer}
+
+-- INTEGER and SSE arguments have independent register sequences in SysV.
+local va_record: Id
+local va_save_slot: integer
+local va_fixed: Abi
+local va_last: string
+
+local function place(abi: *Abi,k: Id): Placement
+  if ct.floating(k) then
+    if abi.sse < 8 then abi.sse=abi.sse+1; return {kind=k,reg=abi.sse} end
+  elseif ct.is_integer(k) or ct.is_pointer(k) then
+    if abi.gp < 6 then abi.gp=abi.gp+1; return {kind=k,reg=abi.gp} end
+  else fail('unsupported aggregate argument') end
+  abi.stack=abi.stack+1
+  return {kind=k}
+end
+
+local function record_classes(k: Id, parts: *[2]Id): integer
+  local count = ct.abi_parts(k, parts)
+  if count == 0 then fail('unsupported aggregate calling convention') end
+  return count
+end
+
+local function place_record(abi: *Abi, k: Id, locations: *sequence(Placement))
+  local parts: [2]Id
+  local count = record_classes(k, &parts)
+  local gp, sse: integer = 0, 0
+  for i = 0, count-1 do
+    if ct.floating(parts[i]) then sse = sse + 1 else gp = gp + 1 end
+  end
+  -- Both eightbytes go on the stack if either register class is exhausted.
+  local spilled = abi.gp + gp > 6 or abi.sse + sse > 8
+  for i = 0, count-1 do
+    if spilled then abi.stack = abi.stack + 1; locations:push({kind=parts[i]})
+    else locations:push(place(abi, parts[i])) end
+  end
+end
+
+-- R11 holds the source address. Never read beyond the last byte of the object.
+local function load_record_piece(k: Id, i: integer)
+  local off = i*8
+  local n = ct.size(k)-off
+  local base = tostring(off) .. '(%r11)'
+  if n >= 8 then emit('movq ' .. base .. ', %rax')
+  elseif n == 4 then emit('movl ' .. base .. ', %eax')
+  elseif n == 2 then emit('movzwl ' .. base .. ', %eax')
+  elseif n == 1 then emit('movzbl ' .. base .. ', %eax')
+  else
+    emit('xorl %eax, %eax')
+    for j = n-1, 0, -1 do
+      if j < n-1 then emit('shlq $8, %rax') end
+      emit('movb ' .. tostring(off+j) .. '(%r11), %al')
+    end
+  end
+end
+
+local function transfer_record_result(k: Id, returning: boolean)
+  local parts: [2]Id
+  local count = record_classes(k, &parts)
+  local slot: integer = 0
+  if returning then emit('movq %rax, %r11') else slot = reserve(k) end
+  local gp, xmm: integer = 0, 0
+  -- R10 preserves the first INTEGER return while the second piece is loaded into RAX.
+  for i = 0, count-1 do
+    if returning then load_record_piece(k, i) end
+    if ct.floating(parts[i]) then
+      local reg = '%xmm' .. tostring(xmm)
+      if returning then xmm_in(Kind.Double, reg)
+      else emit('movq ' .. reg .. ', %r10'); emit('movq %r10, ' .. address(slot-i*8)) end
+      xmm = xmm + 1
+    else
+      if returning then emit('movq %rax, ' .. (gp == 0 and '%r10' or '%rdx'))
+      else emit('movq ' .. (gp == 0 and '%rax' or '%rdx') .. ', ' .. address(slot-i*8)) end
+      gp = gp + 1
+    end
+  end
+  if not returning then emit('leaq ' .. address(slot) .. ', %rax')
+  elseif gp > 0 then emit('movq %r10, %rax') end
+end
+
+local function call(target: Expr): Expr
+  local fn=target.kind
+  local direct=#target.symbol > 0 and ct.is_function(fn)
+  if not direct then
+    fn=ct.element(value(target).kind)
+    if not ct.is_function(fn) then fail('object is not a function') end
+    push_result()
+  end
+  local sig=ct.signature(fn)
+  local args: sequence(Placement)
+  local logical_count: integer = 0
+  local abi: Abi
+  if not take(')') then
+    repeat
+      local e=expression(2)
+      local k: Id
+      if logical_count < sig.arity then k=sig.parameters[logical_count+1]
+      elseif sig.variadic or sig.unspecified then
+        e=value(e)
+        k=e.kind == Kind.Float and Kind.Double or ct.promote(e.kind)
+      else fail('wrong number of arguments for ' .. target.symbol) end
+      logical_count = logical_count + 1
+      if ct.is_record(k) then
+        if value(e).kind ~= k then fail('incompatible record argument') end
+        local first = #args
+        place_record(&abi, k, &args)
+        emit('movq %rax, %r11')
+        for i = 0, (@integer)(#args-first)-1 do load_record_piece(k, i); push_result() end
+      else
+        convert(e, k, false); args:push(place(&abi, k)); push_result()
+      end
+    until not take(',')
+    expect(')')
+  end
+  local count=(@integer)(#args)
+  if logical_count < sig.arity then fail('wrong number of arguments for ' .. target.symbol) end
+  if abi.stack == 0 then
+    for i=count,1,-1 do
+      local a=args[i]
+      if ct.floating(a.kind) then
+        pop_result('%rax'); xmm_in(a.kind,'%xmm' .. tostring(a.reg-1))
+      else pop_result(wide_registers[a.reg-1]) end
+    end
+    if not direct then pop_result('%r11') end
+  else
+    emit('movq %rsp, %r10')
+    for i=1,count do
+      local a=args[i]
+      local src=tostring((count-i)*8) .. '(%r10)'
+      if a.reg ~= 0 then
+        if ct.floating(a.kind) then emit('movq ' .. src .. ', %rax'); xmm_in(a.kind, '%xmm' .. tostring(a.reg-1))
+        else emit('movq ' .. src .. ', ' .. wide_registers[a.reg-1]) end
+      end
+    end
+    if not direct then emit('movq ' .. tostring(count*8) .. '(%r10), %r11') end
+  end
+  local pad=(depth+abi.stack)%2 ~= 0
+  if pad then emit('subq $8, %rsp') end
+  for i=count,1,-1 do
+    if args[i].reg == 0 then emit('pushq ' .. tostring((count-i)*8) .. '(%r10)') end
+  end
+  if sig.variadic or sig.unspecified then emit('movl $' .. tostring(abi.sse) .. ', %eax') end
+  emit('call ' .. (direct and target.symbol or '*%r11'))
+  local reclaim=pad and 1 or 0
+  if abi.stack > 0 then
+    local saved=count+(direct and 0 or 1)
+    depth=depth-saved; reclaim=reclaim+abi.stack+saved
+  end
+  if reclaim > 0 then emit('addq $' .. tostring(reclaim*8) .. ', %rsp') end
+  args:destroy()
+  if ct.is_record(sig.result) then
+    transfer_record_result(sig.result, false)
+    return {kind=sig.result}
+  end
+  if sig.result ~= Kind.Void and not scalar(sig.result) then fail('unsupported call result') end
+  if ct.floating(sig.result) then xmm_out(sig.result,'%xmm0') else normalize(sig.result) end
+  return {kind=sig.result}
+end
+
+local function member(e: Expr, arrow: boolean): Expr
+  local k = e.kind
+  if arrow then k=ct.element(value(e).kind); e.readonly=false end
+  if not ct.is_record(k) or ct.size(k) == 0 then fail('member access needs a complete struct or union') end
+  local name=identifier()
+  local field,offset_bytes=ct.member(k,name)
+  if field == Kind.Unknown then fail('unknown field ' .. name) end
+  if offset_bytes ~= 0 then emit('addq $' .. tostring(offset_bytes) .. ', %rax') end
+  return {kind=field,lvalue=true,readonly=e.readonly}
+end
+
+local function resolve(name: string): Expr
+  local v=locals[name]
+  if v.level == 0 then
+    if variables:has(name) then v=variables[name]
+    elseif functions:has(name) then return {kind=ct.function_type(functions[name]),symbol=name}
+    elseif enumerators:has(name) then
+      local n=enumerators[name]; immediate(n)
+      return {kind=Kind.Int,null_constant=n == 0}
+    else fail('undeclared local ' .. name) end
+  end
+  local place=v.slot ~= 0 and address(v.slot) or (v.symbol .. '(%rip)')
+  emit('leaq ' .. place .. ', %rax')
+  return {kind=v.kind,lvalue=true,readonly=v.readonly,place=place,mark=#body}
+end
+
+local function postfix(e: Expr): Expr
+  while true do
+    if take('(') then e=call(e)
+    elseif take('[') then
+      e=value(e); push_result()
+      local index=value(expression(1))
+      expect(']'); pop_result('%rcx')
+      if ct.is_integer(e.kind) and ct.is_pointer(index.kind) then
+        emit('xchgq %rcx, %rax'); e,index=index,e
+      end
+      if not ct.is_pointer(e.kind) or not ct.is_integer(index.kind) then fail('invalid subscript') end
+      local width=step(e.kind)
+      if width ~= 1 then emit('imulq $' .. tostring(width) .. ', %rax') end
+      emit('addq %rcx, %rax')
+      e={kind=ct.element(e.kind),lvalue=true}
+    elseif take('.') then e=member(e,false)
+    elseif take('->') then e=member(e,true)
+    elseif take('++') then e=change(e,true,true)
+    elseif take('--') then e=change(e,false,true)
+    else break end
+  end
+  return e
+end
+
+local function va_pointer()
+  if value(expression(2)).kind ~= ct.pointer(va_record) then fail('expected va_list') end
+end
+
+local function variadic_builtin(op: string): Expr
+  expect('(')
+  va_pointer()
+  if op == '__builtin_va_start' then
+    if va_save_slot == 0 then fail('va_start outside a variadic function') end
+    expect(',')
+    if identifier() ~= va_last then fail('va_start requires the last fixed parameter') end
+    expect(')')
+    emit('movl $' .. tostring(va_fixed.gp*8) .. ', (%rax)')
+    emit('movl $' .. tostring(48 + va_fixed.sse*16) .. ', 4(%rax)')
+    emit('leaq ' .. tostring(16 + va_fixed.stack*8) .. '(%rbp), %rdx')
+    emit('movq %rdx, 8(%rax)')
+    emit('leaq ' .. address(va_save_slot) .. ', %rdx')
+    emit('movq %rdx, 16(%rax)')
+  elseif op == '__builtin_va_arg' then
+    expect(',')
+    local k = read_type()
+    if not scalar(k) or k == Kind.Float or (ct.is_integer(k) and ct.promote(k) ~= k) then
+      fail('unsupported or unpromoted variadic argument type')
+    end
+    local floating = ct.floating(k)
+    local field = floating and '4(%rax)' or '(%rax)'
+    local stack, done = label(), label()
+    emit('movl ' .. field .. ', %ecx')
+    emit('cmpl $' .. (floating and '176' or '48') .. ', %ecx')
+    emit('jae ' .. stack)
+    emit('addl $' .. (floating and '16' or '8') .. ', ' .. field)
+    emit('addq 16(%rax), %rcx')
+    emit('jmp ' .. done)
+    emit(stack .. ':')
+    emit('movq 8(%rax), %rcx')
+    emit('addq $8, 8(%rax)')
+    emit(done .. ':')
+    load_memory(k, '(%rcx)')
+    return {kind=k}
+  elseif op == '__builtin_va_copy' then
+    push_result()
+    expect(',')
+    va_pointer()
+    expect(')')
+    pop_result('%rdx')
+    copy_record(va_record, va_record)
+  else expect(')') end
+  return {kind=Kind.Void}
+end
+
+function unary(): Expr
+  local op=token
+  if op == '__builtin_va_start' or op == '__builtin_va_arg' or op == '__builtin_va_copy' or op == '__builtin_va_end' then
+    next_token()
+    return postfix(variadic_builtin(op))
+  elseif take('&') then
+    local e=unary()
+    if ct.is_function(e.kind) then return value(e) end
+    if not e.lvalue then fail('address requires an lvalue') end
+    return {kind=ct.pointer(e.kind)}
+  elseif take('*') then
+    local t=value(unary()).kind
+    if not ct.is_pointer(t) or ct.element(t) == Kind.Void then fail('invalid pointer dereference') end
+    return {kind=ct.element(t),lvalue=true}
+  elseif take('++') or take('--') then return change(unary(),op == '++',false)
+  elseif take('+') or take('-') or take('~') then
+    local e=value(unary())
+    if ct.floating(e.kind) then
+      if op == '~' then fail('integer operand required') end
+      if op == '-' then emit(e.kind == Kind.Float and 'xorl $0x80000000, %eax' or 'btcq $63, %rax') end
+      return {kind=e.kind}
+    end
+    if not ct.is_integer(e.kind) then fail('expected integer expression') end
+    local k=ct.promote(e.kind)
+    if op ~= '+' then
+      emit((op == '-' and 'neg' or 'not') .. (ct.size(k) == 8 and 'q %rax' or 'l %eax'))
+      normalize(k)
+    end
+    return {kind=k,null_constant=e.null_constant and op ~= '~'}
+  elseif take('!') then
+    condition(unary()); emit('sete %al'); emit('movzbl %al, %eax')
+    return {kind=Kind.Int}
+  elseif take('__builtin_offsetof') then
+    local words: ce.Tokens
+    words:push(op)
+    expect('('); words:push('(')
+    local depth: integer = 1
+    while depth > 0 do
+      if #token == 0 then fail('unterminated offsetof') end
+      if token == '(' then depth = depth + 1 elseif token == ')' then depth = depth - 1 end
+      words:push(token); next_token()
+    end
+    local n, ok = ce.evaluate(&words, &enumerators, &aliases)
+    words:destroy()
+    if not ok then fail('invalid offsetof operand') end
+    immediate(n)
+    return {kind=Kind.ULong, null_constant=n == 0}
+  elseif take('sizeof') or take('_Alignof') then
+    local k: Id
+    local mark=#body
+    if take('(') then
+      if headers.starts_type(token,&aliases) and locals[token].level == 0 then k=read_type()
+      else k=expression(1).kind; expect(')') end
+    else k=unary().kind end
+    while #body > mark do body:pop() end
+    local n=op == 'sizeof' and ct.size(k) or ct.align(k)
+    if n == 0 then fail('size requires a complete object type') end
+    immediate(n)
+    return {kind=Kind.ULong}
+  elseif take('(') then
+    if headers.starts_type(token,&aliases) and locals[token].level == 0 then
+      local k=read_type()
+      if token == '{' then
+        local slot = reserve(k)
+        zero_local(k, slot)
+        local_init(k, slot)
+        emit('leaq ' .. address(slot) .. ', %rax')
+        return postfix({kind=k, lvalue=true})
+      end
+      return convert(unary(),k,true)
+    end
+    local e=expression(1); expect(')')
+    return postfix(e)
+  elseif #token > 0 and token:byte(1) == 34 then
+    local bytes=strings()
+    local name=string_symbol(&bytes)
+    emit('leaq ' .. name .. '(%rip), %rax')
+    local e: Expr={kind=ct.array(Kind.Char,(@integer)(#bytes)),lvalue=true}
+    bytes:destroy()
+    return postfix(e)
+  elseif #token > 0 and token:byte(1) == 39 then
+    local n,ok=ce.character(token)
+    if not ok then fail('invalid character constant') end
+    immediate(n); next_token()
+    return postfix({kind=Kind.Int,null_constant=n == 0})
+  elseif #token > 0 and (digit(token:byte(1)) or token:byte(1) == 46) then
+    if fp.token(token) then
+      local bits,k=fp.literal(token)
+      if k == Kind.Unknown then fail('invalid or unsupported floating literal') end
+      immediate(bits); next_token(); return postfix({kind=k})
+    end
+    local n,k,reason=ce.literal(token)
+    if #reason > 0 then fail(reason) end
+    immediate(n); next_token()
+    return postfix({kind=k,null_constant=n == 0,literal=true,number=n,mark=#body})
+  end
+  return postfix(resolve(identifier()))
+end
+
+local function precedence(op: string): integer
+  local n=#op
+  if n==0 or n>3 then return 0 end
+  local c=op.data[0]
+  if n==1 then
+    if c==','_b then return 1 elseif c=='='_b then return 2 elseif c=='?'_b then return 3
+    elseif c=='|'_b then return 6 elseif c=='^'_b then return 7 elseif c=='&'_b then return 8
+    elseif c=='<'_b or c=='>'_b then return 10 elseif c=='+'_b or c=='-'_b then return 12
+    elseif c=='*'_b or c=='/'_b or c=='%'_b then return 13 end
+  elseif n==2 then
+    local d=op.data[1]
+    if d=='='_b then
+      if c=='='_b or c=='!'_b then return 9 elseif c=='<'_b or c=='>'_b then return 10
+      elseif c=='+'_b or c=='-'_b or c=='*'_b or c=='/'_b or c=='%'_b or c=='&'_b or c=='|'_b or c=='^'_b then return 2 end
+    elseif c==d then
+      if c=='|'_b then return 4 elseif c=='&'_b then return 5 elseif c=='<'_b or c=='>'_b then return 11 end
+    end
+  elseif (c=='<'_b or c=='>'_b) and op.data[1]==c and op.data[2]==61 then return 2 end
+  return 0
+end
+
+local function compare_result(op: string, unsigned: boolean): Expr
+  local code: string
+  if op == '==' then code='e' elseif op == '!=' then code='ne'
+  elseif op == '<' then code=unsigned and 'b' or 'l'
+  elseif op == '>' then code=unsigned and 'a' or 'g'
+  elseif op == '<=' then code=unsigned and 'be' or 'le'
+  else code=unsigned and 'ae' or 'ge' end
+  emit('set' .. code .. ' %al'); emit('movzbl %al, %eax')
+  return {kind=Kind.Int,cc=code,mark=#body}
+end
+
+local function compare(op: string, unsigned: boolean, wide: boolean): Expr
+  emit(wide and 'cmpq %rax, %rcx' or 'cmpl %eax, %ecx')
+  return compare_result(op,unsigned)
+end
+
+local function branch(e: Expr, target: string, when_true: boolean)
+  if #e.cc>0 and #body==e.mark then
+    body:pop(); body:pop()
+    local cc=e.cc
+    if not when_true then
+      if cc=='e' then cc='ne' elseif cc=='ne' then cc='e'
+      elseif cc=='l' then cc='ge' elseif cc=='ge' then cc='l'
+      elseif cc=='g' then cc='le' elseif cc=='le' then cc='g'
+      elseif cc=='b' then cc='ae' elseif cc=='ae' then cc='b'
+      elseif cc=='a' then cc='be' else cc='a' end
+    end
+    emit('j' .. cc .. ' ' .. target)
+  else
+    condition(e)
+    emit((when_true and 'jne ' or 'je ') .. target)
+  end
+end
+
+local function float_binary(op: string,a: Expr,b: Expr,k: Id): Expr
+  push_result()
+  emit('movq %rcx, %rax')
+  convert(a,k,false); xmm_in(k,'%xmm2')
+  pop_result('%rax')
+  convert(b,k,false); xmm_in(k,'%xmm0')
+  if op == '+' or op == '-' or op == '*' or op == '/' then
+    local instruction=op == '+' and 'add' or (op == '-' and 'sub' or (op == '*' and 'mul' or 'div'))
+    emit(sse.arithmetic(k, instruction, 0, 2)); xmm_out(k,'%xmm2')
+    return {kind=k}
+  elseif op == '==' or op == '!=' or op == '<' or op == '<=' or op == '>' or op == '>=' then
+    if op == '<' or op == '<=' then emit(sse.compare(k, 2, 0))
+    else emit(sse.compare(k, 0, 2)) end
+    if op == '==' then emit('sete %al'); emit('setnp %dl'); emit('andb %dl, %al')
+    elseif op == '!=' then emit('setne %al'); emit('setp %dl'); emit('orb %dl, %al')
+    elseif op == '<' or op == '>' then emit('seta %al')
+    else emit('setae %al') end
+    emit('movzbl %al, %eax')
+    return {kind=Kind.Int}
+  end
+  fail('invalid floating-point operator ' .. op)
+  return {}
+end
+
+-- At entry RCX holds the left operand and RAX holds the right.
+local function binary(op: string, a: Expr, b: Expr): Expr
+  local equality=op == '==' or op == '!='
+  local comparison=equality or op == '<' or op == '>' or op == '<=' or op == '>='
+  if ct.is_pointer(a.kind) or ct.is_pointer(b.kind) then
+    if comparison and ((ct.is_pointer(a.kind) and ct.is_pointer(b.kind) and compatible_pointer(a.kind,b.kind)) or
+        (equality and (a.null_constant or b.null_constant))) then return compare(op,true,true) end
+    if op == '+' and ct.is_integer(a.kind) and ct.is_pointer(b.kind) then
+      emit('xchgq %rax, %rcx'); a,b=b,a
+    end
+    if ct.is_pointer(a.kind) and ct.is_integer(b.kind) and (op == '+' or op == '-') then
+      local width=step(a.kind)
+      if width ~= 1 then emit('imulq $' .. tostring(width) .. ', %rax') end
+      if op == '-' then emit('negq %rax') end
+      emit('addq %rcx, %rax'); return {kind=a.kind}
+    elseif op == '-' and ct.is_pointer(a.kind) and a.kind == b.kind then
+      local width=step(a.kind)
+      emit('subq %rax, %rcx'); emit('movq %rcx, %rax')
+      if width ~= 1 then emit('movq $' .. tostring(width) .. ', %rcx'); emit('cqto'); emit('idivq %rcx') end
+      return {kind=Kind.Long}
+    end
+    fail('invalid pointer operands')
+  end
+  if ct.floating(a.kind) or ct.floating(b.kind) then
+    if not scalar(a.kind) or not scalar(b.kind) then fail('expected arithmetic operands') end
+    return float_binary(op,a,b,ct.common(a.kind,b.kind))
+  end
+  if not ct.is_integer(a.kind) or not ct.is_integer(b.kind) then fail('expected integer operands') end
+  local shift=op == '<<' or op == '>>'
+  local k=shift and ct.promote(a.kind) or ct.common(a.kind,b.kind)
+  local wide=ct.size(k) == 8
+  if comparison then return compare(op,ct.unsigned(k),wide) end
+  local suffix=wide and 'q' or 'l'
+  local acc,other,rem: string = wide and '%rax' or '%eax',wide and '%rcx' or '%ecx',wide and '%rdx' or '%edx'
+  if op == '+' then emit('add' .. suffix .. ' ' .. other .. ', ' .. acc)
+  elseif op == '-' then
+    emit('sub' .. suffix .. ' ' .. acc .. ', ' .. other); emit('mov' .. suffix .. ' ' .. other .. ', ' .. acc)
+  elseif op == '&' or op == '|' or op == '^' then
+    emit((op == '&' and 'and' or (op == '|' and 'or' or 'xor')) .. suffix .. ' ' .. other .. ', ' .. acc)
+  elseif shift then
+    emit('xchg' .. suffix .. ' ' .. acc .. ', ' .. other)
+    emit((op == '<<' and 'shl' or (ct.unsigned(k) and 'shr' or 'sar')) .. suffix .. ' %cl, ' .. acc)
+  elseif op == '*' then emit('imul' .. suffix .. ' ' .. other .. ', ' .. acc)
+  else
+    emit('xchg' .. suffix .. ' ' .. acc .. ', ' .. other)
+    if ct.unsigned(k) then emit('xorl %edx, %edx'); emit('div' .. suffix .. ' ' .. other)
+    else emit(wide and 'cqto' or 'cltd'); emit('idiv' .. suffix .. ' ' .. other) end
+    if op == '%' then emit('mov' .. suffix .. ' ' .. rem .. ', ' .. acc) end
+  end
+  normalize(k)
+  return {kind=k}
+end
+
+-- For a single load or immediate on the right, use the corresponding x86
+-- operand directly. A complex expression can call functions or change memory
+-- and must keep its original evaluation order and saved left operand.
+local function finish_integer(op: string,a: Expr,b: Expr,mark: usize): Expr
+  if #body==mark+2 and b.mark==#body and ct.is_integer(a.kind) and ct.is_integer(b.kind) then
+    local k=ct.common(a.kind,b.kind)
+    local width=ct.size(k)
+    local source: string
+    if b.literal and b.number>=-2147483648 and b.number<=2147483647 then
+      source='$' .. tostring(b.number)
+    elseif #b.place>0 and ct.size(b.kind)==width then
+      source=b.place
+    end
+    local instruction: string
+    if op=='+' then instruction='add' elseif op=='-' then instruction='sub'
+    elseif op=='*' then instruction='imul' elseif op=='&' then instruction='and'
+    elseif op=='|' then instruction='or' elseif op=='^' then instruction='xor'
+    elseif op=='==' or op=='!=' or op=='<' or op=='>' or op=='<=' or op=='>=' then instruction='cmp' end
+    if #instruction>0 and #source>0 then
+      body:pop(); body:pop(); depth=depth-1
+      emit(instruction .. (width==8 and 'q ' or 'l ') .. source .. (width==8 and ', %rax' or ', %eax'))
+      if instruction=='cmp' then return compare_result(op,ct.unsigned(k)) end
+      normalize(k)
+      return {kind=k}
+    end
+  end
+  pop_result('%rcx')
+  return binary(op,a,b)
+end
+
+function expression(minimum: integer): Expr
+  local e: Expr = unary()
+  while true do
+    local p=precedence(token)
+    if p<minimum then break end
+    local op=token
+    next_token()
+    if op == ',' then value(e); e=value(expression(p+1))
+    elseif p == 2 then
+      if op == '=' and ct.is_record(e.kind) then
+        if not e.lvalue or e.readonly then fail('expected a modifiable record lvalue') end
+        push_result()
+        local rhs = value(expression(p))
+        pop_result('%rdx')
+        copy_record(e.kind, rhs.kind)
+      else
+        writable(e)
+        local direct=#e.place>0 and #body==e.mark
+        if direct then body:pop() else push_result() end
+        local mark=#body
+        if op~='=' then
+          load_memory(e.kind,direct and e.place or '(%rax)')
+          mark=#body
+          push_result()
+        end
+        local rhs=value(expression(p))
+        if op~='=' then rhs=finish_integer(op:subview(1,-2),{kind=e.kind},rhs,mark) end
+        convert(rhs,e.kind,false)
+        if direct then store_memory(e.kind,e.place)
+        else pop_result('%rdx'); store_memory(e.kind,'(%rdx)') end
+      end
+      e={kind=e.kind}
+    elseif op == '?' then
+      local other,yes_convert,done=label(),label(),label()
+      branch(e,other,false)
+      local yes=value(expression(1)); expect(':')
+      emit('jmp ' .. yes_convert); emit(other .. ':')
+      local no=value(expression(p))
+      local k=yes.kind
+      if (ct.is_integer(k) or ct.floating(k)) and (ct.is_integer(no.kind) or ct.floating(no.kind)) then k=ct.common(k,no.kind)
+      elseif ct.is_pointer(k) and no.null_constant then
+      elseif ct.is_pointer(no.kind) and yes.null_constant then k=no.kind
+      elseif ct.is_pointer(k) and ct.is_pointer(no.kind) and compatible_pointer(k,no.kind) then
+        if ct.element(no.kind) == Kind.Void then k=no.kind end
+      elseif k ~= no.kind then fail('incompatible conditional operands') end
+      if scalar(k) then convert(no,k,false) end
+      emit('jmp ' .. done); emit(yes_convert .. ':')
+      if scalar(k) then convert(yes,k,false) end
+      emit(done .. ':'); e={kind=k}
+    elseif op == '&&' or op == '||' then
+      local short,done=label(),label()
+      branch(e,short,op=='||')
+      condition(expression(p+1)); emit('setne %al'); emit('movzbl %al, %eax')
+      emit('jmp ' .. done); emit(short .. ':'); immediate(op == '&&' and 0 or 1); emit(done .. ':')
+      e={kind=Kind.Int}
+    else
+      e=value(e)
+      local mark=#body
+      push_result()
+      local rhs=value(expression(p+1))
+      e=finish_integer(op,e,rhs,mark)
+    end
+  end
+  return e
+end
+
+local function read_constant(): headers.Tokens
+  local words: headers.Tokens
+  local nest: integer=0
+  while #token > 0 and (nest > 0 or (token ~= ',' and token ~= '}' and token ~= ';')) do
+    if token == '(' then nest=nest+1 elseif token == ')' then nest=nest-1 end
+    words:push(token); next_token()
+  end
+  return words
+end
+
+local function static_assertion()
+  expect('_Static_assert')
+  expect('(')
+  local words = read_constant()
+  local n, ok = ce.evaluate(&words, &enumerators, &aliases)
+  words:destroy()
+  expect(',')
+  if #token == 0 or token:byte(1) ~= 34 then fail('expected static assertion message') end
+  local message = token
+  repeat next_token() until #token == 0 or token:byte(1) ~= 34
+  expect(')')
+  expect(';')
+  if not ok then fail('expected integer constant expression in static assertion') end
+  if n == 0 then fail('static assertion failed: ' .. message) end
+end
+
+local function space(out: *sequence(string), n: integer)
+  if n > 0 then out:push('  .space ' .. tostring(n)) end
+end
+
+local function pointer_constant(words: *headers.Tokens, first: usize, last: usize, k: Id): string
+  if first > last then fail('expected pointer initializer') end
+  if ($words)[first] == '(' then
+    local close=first+1
+    local nesting: integer=1
+    while close <= last do
+      local w=($words)[close]
+      if w == '(' then nesting=nesting+1 elseif w == ')' then nesting=nesting-1 end
+      if nesting == 0 then break end
+      close=close+1
+    end
+    if close == last then return pointer_constant(words,first+1,last-1,k) end
+    if close < last and headers.starts_type(($words)[first+1],&aliases) then
+      local cast: headers.Tokens
+      for i=first+1,close-1 do cast:push(($words)[i]) end
+      local d=headers.parse(&cast,&aliases,&enumerators)
+      if not ct.is_pointer(d.kind) or #d.name ~= 0 then fail('unsupported address initializer cast') end
+      local symbol=pointer_constant(words,close+1,last,d.kind)
+      if symbol ~= '0' and not compatible_pointer(d.kind,k) then fail('incompatible pointer initializer') end
+      return symbol
+    end
+  end
+  local addr=($words)[first] == '&'
+  local at=addr and first+1 or first
+  if at == last then
+    local name=($words)[at]
+    if functions:has(name) then
+      if not compatible_pointer(ct.pointer(ct.function_type(functions[name])),k) then fail('incompatible function pointer') end
+      return name
+    elseif variables:has(name) then
+      local v=variables[name]
+      local t=addr and ct.pointer(v.kind) or (ct.is_array(v.kind) and ct.pointer(ct.element(v.kind)) or Kind.Unknown)
+      if t == Kind.Unknown or not compatible_pointer(t,k) then fail('incompatible address initializer') end
+      return v.symbol
+    end
+  end
+  local expr: ce.Tokens
+  for i=first,last do expr:push(($words)[i]) end
+  local n,ok=ce.evaluate(&expr, &enumerators, &aliases)
+  if ok and n == 0 then return '0' end
+  fail('expected a constant address or null pointer')
+  return ''
+end
+
+local function byte_array(k: Id): boolean
+  local e=ct.element(k)
+  return ct.is_array(k) and (e == Kind.Char or e == Kind.SChar or e == Kind.UChar)
+end
+
+local function floating_initializer(words: *ce.Tokens, k: Id): integer
+  local first, last: integer = 1, (@integer)(#($words))
+  while first < last and ($words)[first] == '(' and ($words)[last] == ')' do
+    first, last = first + 1, last - 1
+  end
+  if first <= last then
+    local sign = ($words)[first]
+    if sign == '+' or sign == '-' then first = first + 1 end
+    if first == last and fp.token(($words)[first]) then
+      local bits, from = fp.literal(($words)[first])
+      if from == Kind.Unknown then fail('invalid floating initializer') end
+      if sign == '-' then bits = bits ~ (from == Kind.Float and 0x80000000 or (-9223372036854775807-1)) end
+      return fp.convert(bits, from, k)
+    end
+  end
+  local n, ok, from = ce.evaluate(words, &enumerators, &aliases)
+  if not ok then fail('unsupported floating constant expression') end
+  return fp.convert(n, from, k)
+end
+
+local InitializerTarget = @record{kind: Id, offset: integer, index: integer}
+local Fragment = @record{offset: integer, size: integer, lines: sequence(string)}
+
+local function initializer_target(k: Id, index: integer): InitializerTarget
+  if ct.is_array(k) then
+    if take('[') then
+      local words: ce.Tokens
+      local brackets: integer = 0
+      while #token > 0 and (brackets > 0 or token ~= ']') do
+        if token == '[' then brackets = brackets + 1 elseif token == ']' then brackets = brackets - 1 end
+        words:push(token); next_token()
+      end
+      expect(']'); expect('=')
+      local n, ok = ce.evaluate(&words, &enumerators, &aliases)
+      words:destroy()
+      if not ok or n < 0 then fail('invalid array designator') end
+      index = n
+    end
+    local child = ct.element(k)
+    local bound = ct.count(k)
+    if (bound > 0 and index >= bound) or index >= 9223372036854775807 // ct.size(child) then
+      fail('excess array initializer')
+    end
+    return {kind=child, offset=index*ct.size(child), index=index}
+  end
+  local fields = ct.members(k)
+  if take('.') then
+    local name = identifier()
+    expect('=')
+    index = 0
+    while index < (@integer)(#($fields)) and ($fields)[index+1].name ~= name do index = index + 1 end
+    if index >= (@integer)(#($fields)) then fail('unknown initializer field ' .. name) end
+  elseif ct.is_union(k) and index ~= 0 then fail('excess union initializer') end
+  if index >= (@integer)(#($fields)) then fail('excess struct initializer') end
+  local field = ($fields)[index+1]
+  return {kind=field.kind, offset=field.offset, index=index}
+end
+
+-- Collect fragments in layout order. Later designators override earlier values.
+local function insert_fragment(fragments: *sequence(Fragment), item: Fragment)
+  local at = #($fragments)
+  while at > 0 and ($fragments)[at].offset > item.offset do at = at - 1 end
+  if at > 0 and ($fragments)[at].offset == item.offset then
+    local previous = &($fragments)[at]
+    previous.lines:destroy()
+    $previous = item
+  else fragments:insert(at + 1, item) end
+end
+
+local function global_init(k: Id, out: *sequence(string)): Id
+  if byte_array(k) and #token > 0 and token:byte(1) == 34 then
+    local bytes = strings()
+    local count, bound = (@integer)(#bytes), ct.count(k)
+    if bound == 0 then bound = count end
+    if bound < count - 1 then fail('excess array initializer') end
+    if bound < count then count = bound end
+    for i = 1, count do out:push('  .byte ' .. tostring(bytes[i])) end
+    bytes:destroy()
+    space(out, bound-count)
+    return ct.array(ct.element(k), bound)
+  elseif ct.is_record(k) or ct.is_array(k) then
+    expect('{')
+    local fragments: sequence(Fragment)
+    local next_index, max_count: integer = 0, 0
+    while token ~= '}' do
+      local target = initializer_target(k, next_index)
+      local fragment: Fragment = {offset=target.offset, size=ct.size(target.kind)}
+      global_init(target.kind, &fragment.lines)
+      insert_fragment(&fragments, fragment)
+      next_index = target.index + 1
+      if next_index > max_count then max_count = next_index end
+      if not take(',') then break end
+    end
+    expect('}')
+    if ct.is_array(k) and ct.count(k) == 0 then k = ct.array(ct.element(k), max_count) end
+    if ct.size(k) == 0 then fail('initializer needs a complete type') end
+    local offset: integer = 0
+    for i: usize = 1, #fragments do
+      local fragment = &fragments[i]
+      space(out, fragment.offset - offset)
+      for j: usize = 1, #fragment.lines do out:push(fragment.lines[j]) end
+      offset = fragment.offset + fragment.size
+      fragment.lines:destroy()
+    end
+    fragments:destroy()
+    space(out, ct.size(k)-offset)
+  elseif take('{') then
+    global_init(k,out); take(','); expect('}')
+  elseif ct.is_pointer(k) and #token > 0 and token:byte(1) == 34 then
+    if not compatible_pointer(ct.pointer(Kind.Char),k) then fail('incompatible string initializer') end
+    local bytes=strings()
+    out:push('  .quad ' .. string_symbol(&bytes)); bytes:destroy()
+  else
+    local words=read_constant()
+    if ct.is_pointer(k) then
+      out:push('  .quad ' .. pointer_constant(&words,1,#words,k))
+    elseif ct.floating(k) then
+      local bits = floating_initializer(&words, k)
+      out:push((k == Kind.Float and '  .long ' or '  .quad ') .. tostring(bits))
+    else
+      if not ct.is_integer(k) then fail('unsupported initializer') end
+      local v,ok=ce.evaluate(&words, &enumerators, &aliases)
+      if not ok then fail('invalid or unsupported integer constant expression') end
+      if k == Kind.Bool then v=v ~= 0 and 1 or 0 end
+      local n=ct.size(k)
+      if n == 1 then out:push('  .byte ' .. tostring((@uint8)(v)))
+      elseif n == 2 then out:push('  .short ' .. tostring((@uint16)(v)))
+      elseif n == 4 then out:push('  .long ' .. tostring((@int32)(v)))
+      else out:push('  .quad ' .. tostring(v)) end
+    end
+    words:destroy()
+  end
+  return k
+end
+
+local function object_start(v: Variable,out: *sequence(string))
+  out:push('.balign ' .. tostring(ct.align(v.kind)))
+  if not v.internal then out:push('.globl ' .. v.symbol) end
+  out:push('.type ' .. v.symbol .. ', @object'); out:push(v.symbol .. ':')
+end
+
+local tentative: sequence(string)
+local function global_object(d: headers.Declaration, init: boolean, from_header: boolean)
+  local name=d.name
+  if functions:has(name) or enumerators:has(name) or aliases:has(name) then fail('duplicate global ' .. name) end
+  local v: Variable = variables[name]
+  if v.kind ~= Kind.Unknown then
+    local same=v.kind == d.kind or (ct.is_array(v.kind) and ct.is_array(d.kind) and
+      ct.element(v.kind) == ct.element(d.kind) and (ct.count(v.kind) == 0 or ct.count(d.kind) == 0))
+    if not same or (d.internal and not v.internal) then fail('conflicting declaration for ' .. name) end
+    if ct.is_array(v.kind) and ct.count(v.kind) == 0 then v.kind=d.kind end
+  else
+    v={kind=d.kind,symbol=d.internal and '.Lnecc_global_' .. name or name,internal=d.internal,
+       readonly=d.readonly and not ct.is_pointer(d.kind)}
+  end
+  variables[name]=v
+  if init then
+    if v.defined then fail('duplicate global ' .. name) end
+    local out=v.readonly and &rodata or &data
+    object_start(v,out); v.kind=global_init(v.kind,out)
+    out:push('.size ' .. v.symbol .. ', .-' .. v.symbol); v.defined=true
+  elseif not from_header and not d.external and not v.tentative then
+    v.tentative=true; tentative:push(name)
+  end
+  variables[name]=v
+end
+
+function local_init(k: Id, slot: integer)
+  if byte_array(k) and #token > 0 and token:byte(1) == 34 then
+    local bytes = strings()
+    if (@integer)(#bytes)-1 > ct.count(k) then fail('excess array initializer') end
+    for i = 1, ct.count(k) do
+      if i > (@integer)(#bytes) then break end
+      emit('movb $' .. tostring(bytes[i]) .. ', ' .. address(slot-i+1))
+    end
+    bytes:destroy()
+  elseif ct.is_record(k) or ct.is_array(k) then
+    if ct.is_record(k) and token ~= '{' then
+      local source_value = value(expression(2))
+      emit('leaq ' .. address(slot) .. ', %rdx')
+      copy_record(k, source_value.kind)
+      return
+    end
+    expect('{')
+    local next_index: integer = 0
+    while token ~= '}' do
+      local target = initializer_target(k, next_index)
+      local_init(target.kind, slot-target.offset)
+      next_index = target.index + 1
+      if not take(',') then break end
+    end
+    expect('}')
+  elseif take('{') then local_init(k,slot); take(','); expect('}')
+  else convert(expression(2),k,false); store_memory(k,address(slot)) end
+end
+
+local function enum_declaration(words: *headers.Tokens): boolean
+  local added: ce.Names
+  if not ce.enumeration(words, &enumerators, &added, &aliases) then return false end
+  for name,n in pairs(added) do
+    if not allowed_name(name) or functions:has(name) or variables:has(name) or aliases:has(name) then
+      fail('invalid or conflicting enumerator ' .. name)
+    end
+    enumerators[name]=n
+  end
+  if ($words)[1] == 'typedef' then aliases[($words)[#($words)]]=Kind.Int end
+  added:destroy()
+  return true
+end
+
+local function register_fn(d: headers.Declaration, definition: boolean): ct.Signature
+  if variables:has(d.name) or aliases:has(d.name) or enumerators:has(d.name) then fail('duplicate global ' .. d.name) end
+  local sig=ct.signature(d.kind); sig.internal=d.internal
+  if functions:has(d.name) then
+    local prev=functions[d.name]
+    if (not prev.unspecified and not sig.unspecified and ct.function_type(prev) ~= d.kind) or
+        prev.result ~= sig.result or (d.internal and not prev.internal) then fail('conflicting declaration for ' .. d.name) end
+    if definition and prev.defined then fail('multiple definitions of ' .. d.name) end
+    sig.internal=prev.internal; sig.defined=prev.defined
+    if not definition and sig.unspecified and not prev.unspecified then return prev end
+  end
+  if definition then sig.defined=true end
+  functions[d.name]=sig
+  return sig
+end
+
+local function save_typedef(d: headers.Declaration)
+  if enumerators:has(d.name) or functions:has(d.name) or variables:has(d.name) or
+      (aliases:has(d.name) and aliases[d.name] ~= d.kind) then fail('conflicting typedef ' .. d.name) end
+  aliases[d.name]=d.kind
+end
+
+local function header_declaration()
+  local words: headers.Tokens
+  local braces,parens: integer=0,0
+  local ended,body = false,false
+  while #token > 0 do
+    if token == ';' and braces == 0 and parens == 0 then
+      next_token()
+      if not enum_declaration(&words) then
+        local d=headers.parse(&words,&aliases,&enumerators)
+        if d.kind ~= Kind.Unknown and #d.name > 0 then
+          if d.is_typedef then save_typedef(d)
+          elseif ct.is_function(d.kind) and not d.internal then register_fn(d,false)
+          elseif d.external and not ct.is_function(d.kind) then global_object(d,false,true) end
+        end
+      end
+      words:destroy(); return
+    end
+    if token == '{' then
+      if braces == 0 and ended then body=true end
+      braces=braces+1
+    elseif token == '}' then braces=braces-1
+    elseif token == '(' then parens=parens+1
+    elseif token == ')' then
+      parens=parens-1
+      if braces == 0 and parens == 0 then ended=true end
+    end
+    words:push(token); next_token()
+    if body and braces == 0 then words:destroy(); return end
+  end
+  fail('unterminated header declaration')
+end
+
+local function statement(ret: string) <forwarddecl> end
+local function decl_group(top: boolean) <forwarddecl> end
+
+local function starts_decl(): boolean
+  return token == '_Static_assert' or (headers.starts_type(token,&aliases) and locals[token].level == 0) or token == 'static' or
+    token == 'extern' or token == 'typedef' or token == 'inline' or token == 'register'
+end
+
+local function block(ret: string, nested: boolean)
+  local mark=#bindings
+  if nested then scope=scope+1 end
+  while not take('}') do
+    if #token == 0 then fail('expected identifier or closing brace') end
+    if starts_decl() then decl_group(false) else statement(ret) end
+  end
+  if nested then leave_scope(mark); scope=scope-1 end
+end
+
+local function test_branch(target: string)
+  expect('('); local e=expression(1); expect(')'); branch(e,target,false)
+end
+
+local Case = @record{n: integer, target: string}
+local Switch = @record{kind: Id, slot: integer, cases: sequence(Case), fallback: string}
+local switches: sequence(Switch)
+local jump_labels: hashmap(string,string)
+local defined_labels: hashmap(string,boolean)
+
+local function jump_label(name: string): string
+  if not jump_labels:has(name) then jump_labels[name]=label() end
+  return jump_labels[name]
+end
+
+local function followed_by(w: string): boolean
+  local at,ln,tl,head,path,current=offset,line,token_line,inside_header,source_path,token
+  next_token()
+  local found=token == w
+  offset,line,token_line,inside_header,source_path,token=at,ln,tl,head,path,current
+  return found
+end
+
+local function switch_statement(ret: string)
+  expect('(')
+  local k=ct.promote(value(expression(1)).kind)
+  if not ct.is_integer(k) then fail('switch needs an integer expression') end
+  expect(')')
+  local s: Switch={kind=k,slot=reserve(k)}
+  emit('movq %rax, ' .. address(s.slot)); switches:push(s)
+  local dispatch,done=label(),label()
+  local outer_break=break_to; break_to=done
+  emit('jmp ' .. dispatch)
+  statement(ret)
+  break_to=outer_break
+  s=switches:pop()
+  emit('jmp ' .. done); emit(dispatch .. ':')
+  emit('movq ' .. address(s.slot) .. ', %rcx')
+  for i: usize=1,#s.cases do
+    immediate(s.cases[i].n); emit('cmpq %rax, %rcx'); emit('je ' .. s.cases[i].target)
+  end
+  if #s.fallback > 0 then emit('jmp ' .. s.fallback) end
+  emit(done .. ':')
+  s.cases:destroy()
+end
+
+local function case_label(is_default: boolean)
+  if #switches == 0 then fail('case outside switch') end
+  local s=&switches[#switches]
+  local target=label()
+  if is_default then
+    if #s.fallback > 0 then fail('duplicate default') end
+    s.fallback=target
+  else
+    local words: ce.Tokens
+    while #token > 0 and token ~= ':' do words:push(token); next_token() end
+    local n,ok=ce.evaluate(&words, &enumerators, &aliases); words:destroy()
+    if not ok then fail('expected integer case constant') end
+    if s.kind == Kind.Int then n=(@int32)(n) elseif s.kind == Kind.UInt then n=(@uint32)(n) end
+    for i: usize=1,#s.cases do if s.cases[i].n == n then fail('duplicate case value') end end
+    s.cases:push({n=n,target=target})
+  end
+  expect(':'); emit(target .. ':')
+end
+
+function statement(ret: string)
+  if take('{') then block(ret,true)
+  elseif take('switch') then switch_statement(ret)
+  elseif token == 'case' or token == 'default' then
+    local is_default=token == 'default'; next_token(); case_label(is_default); statement(ret)
+  elseif take('goto') then
+    local name=identifier(); expect(';'); emit('jmp ' .. jump_label(name))
+  elseif allowed_name(token) and followed_by(':') then
+    local name=identifier(); expect(':')
+    if defined_labels[name] then fail('duplicate label ' .. name) end
+    defined_labels[name]=true; emit(jump_label(name) .. ':'); statement(ret)
+  elseif take('if') then
+    local otherwise=label()
+    test_branch(otherwise); statement(ret)
+    if take('else') then
+      local done=label()
+      emit('jmp ' .. done); emit(otherwise .. ':'); statement(ret); emit(done .. ':')
+    else emit(otherwise .. ':') end
+  elseif token == 'while' or token == 'for' or token == 'do' then
+    local loop=token; next_token()
+    local saved_break,saved_continue=break_to,continue_to
+    local mark=#bindings; scope=scope+1
+    local check,start,advance,done=label(),label(),label(),label()
+    break_to=done; continue_to=loop == 'for' and advance or check
+    if loop == 'do' then
+      emit(start .. ':'); statement(ret); expect('while'); emit(check .. ':')
+      test_branch(done); expect(';'); emit('jmp ' .. start)
+    elseif loop == 'while' then
+      emit(check .. ':'); test_branch(done); statement(ret); emit('jmp ' .. check)
+    else
+      expect('(')
+      if starts_decl() then decl_group(false)
+      elseif not take(';') then value(expression(1)); expect(';') end
+      emit(check .. ':')
+      if not take(';') then local e=expression(1); expect(';'); branch(e,done,false) end
+      emit('jmp ' .. start); emit(advance .. ':')
+      if not take(')') then value(expression(1)); expect(')') end
+      emit('jmp ' .. check); emit(start .. ':'); statement(ret); emit('jmp ' .. advance)
+    end
+    emit(done .. ':'); break_to,continue_to=saved_break,saved_continue
+    leave_scope(mark); scope=scope-1
+  elseif token == 'break' or token == 'continue' then
+    local target=token == 'break' and break_to or continue_to
+    if #target == 0 then fail('invalid loop jump') end
+    next_token(); expect(';'); emit('jmp ' .. target)
+  elseif take('return') then
+    if ct.is_record(function_result) then
+      if value(expression(1)).kind ~= function_result then fail('incompatible record return') end
+      transfer_record_result(function_result, true)
+    elseif function_result ~= Kind.Void then convert(expression(1),function_result,false)
+    elseif token ~= ';' then
+      if value(expression(1)).kind ~= Kind.Void then fail('unexpected return value') end
+    end
+    if ct.floating(function_result) then xmm_in(function_result,'%xmm0') end
+    expect(';'); emit('jmp ' .. ret)
+  elseif not take(';') then value(expression(1)); expect(';') end
+end
+
+local function compile_function(d: headers.Declaration)
+  local sig=register_fn(d,true)
+  slots, va_save_slot = 0, 0
+  if sig.variadic then
+    -- SysV register-save area: six GP slots, followed by eight 16-byte SSE slots.
+    va_save_slot = reserve(ct.array(Kind.UChar, 176))
+    for i = 0, 5 do emit('movq ' .. wide_registers[i] .. ', ' .. address(va_save_slot - i*8)) end
+    for i = 0, 7 do
+      xmm_out(Kind.Double, '%xmm' .. tostring(i))
+      emit('movq %rax, ' .. address(va_save_slot - 48 - i*16))
+    end
+  end
+  local abi: Abi
+  for i: usize=1,#d.params do
+    local p=d.params[i]
+    if #p.name == 0 then fail('parameters must be named in a definition') end
+    local v = allocate(p.name, p.kind, false)
+    local incoming: sequence(Placement)
+    local stack = abi.stack
+    if ct.is_record(p.kind) then place_record(&abi, p.kind, &incoming)
+    else incoming:push(place(&abi, p.kind)) end
+    for j: usize = 1, #incoming do
+      local a = incoming[j]
+      local dest = address(v.slot - (@integer)(j-1)*8)
+      if a.reg == 0 then
+        emit('movq ' .. tostring(16 + stack*8) .. '(%rbp), %rax')
+        emit('movq %rax, ' .. dest)
+        stack = stack + 1
+      elseif ct.floating(a.kind) then
+        xmm_out(a.kind, '%xmm' .. tostring(a.reg-1)); store_memory(a.kind, dest)
+      else emit('movq ' .. wide_registers[a.reg-1] .. ', ' .. dest) end
+    end
+    incoming:destroy()
+  end
+  if sig.variadic then va_fixed, va_last = abi, d.params[#d.params].name end
+  function_result=sig.result
+  local ret=label()
+  block(ret,false)
+  for name,target in pairs(jump_labels) do
+    if not defined_labels[name] then fail('undefined label ' .. name) end
+  end
+  jump_labels:clear(); defined_labels:clear()
+  if #body>0 and body[#body]=='  jmp ' .. ret then
+    -- The final explicit return falls directly into the common epilogue.
+    body:pop()
+  elseif d.name == 'main' then emit('xorl %eax, %eax')
+  elseif sig.result ~= Kind.Void then emit('ud2') end
+  emit(ret .. ':')
+  if depth ~= 0 then fail('unbalanced expression stack') end
+  if not sig.internal then assembly:push('.globl ' .. d.name) end
+  assembly:push('.type ' .. d.name .. ', @function'); assembly:push(d.name .. ':')
+  local frameless=not qualified_storage and leaf.promote(&body,slots)
+  if not frameless then
+    assembly:push('  pushq %rbp'); assembly:push('  movq %rsp, %rbp')
+    if slots > 0 then assembly:push('  subq $' .. tostring(((slots+15)//16)*16) .. ', %rsp') end
+  end
+  for i: usize=1,#body do assembly:push(body[i]) end
+  if not frameless then assembly:push('  leave') end
+  assembly:push('  ret')
+  assembly:push('.size ' .. d.name .. ', .-' .. d.name)
+  body:clear(); leave_scope(0)
+end
+
+local function tag_word(s: string): boolean return s == 'struct' or s == 'union' or s == 'enum' end
+
+function decl_group(top: boolean)
+  if token == '_Static_assert' then static_assertion(); return end
+  local prefix: headers.Tokens
+  repeat
+    local words: headers.Tokens
+    for i: usize=1,#prefix do words:push(prefix[i]) end
+    local nest: integer=0
+    while #token > 0 do
+      if nest == 0 then
+        if token == '=' or token == ',' or token == ';' then break end
+        if token == '{' and not (#words >= 1 and tag_word(words[#words])) and
+            not (#words >= 2 and tag_word(words[#words-1])) then break end
+      end
+      if token == '(' or token == '[' or token == '{' then nest=nest+1
+      elseif token == ')' or token == ']' or token == '}' then nest=nest-1 end
+      if nest < 0 then fail('expected a declaration') end
+      words:push(token); next_token()
+    end
+    if #words == 0 or nest ~= 0 then fail('expected declaration') end
+    if token == ';' and enum_declaration(&words) then next_token(); return end
+    local d=headers.parse(&words,&aliases,&enumerators)
+    if d.kind == Kind.Unknown then fail('invalid or unsupported declaration of ' .. words[#words]) end
+    if #d.name == 0 then
+      if ct.is_record(d.kind) and take(';') then return end
+      fail('expected identifier in declaration')
+    end
+    if not allowed_name(d.name) then fail('invalid declarator name ' .. d.name) end
+    if #prefix == 0 then for i: usize=1,d.spec_count do prefix:push(words[i]) end end
+    if d.is_typedef then save_typedef(d)
+    elseif ct.is_function(d.kind) then
+      if top and take('{') then compile_function(d); return end
+      register_fn(d,false)
+    elseif top then global_object(d,take('='),false)
+    else
+      local readonly=d.readonly and not ct.is_pointer(d.kind)
+      if d.internal then
+        local v: Variable={kind=d.kind,symbol=label(),internal=true,readonly=readonly}
+        local out=readonly and &rodata or &data
+        object_start(v,out)
+        if take('=') then v.kind=global_init(d.kind,out)
+        else
+          if ct.size(d.kind) <= 0 then fail('incomplete static object') end
+          space(out,ct.size(d.kind))
+        end
+        out:push('.size ' .. v.symbol .. ', .-' .. v.symbol)
+        bind_local(d.name,v)
+      elseif d.external then
+        local v: Variable={kind=d.kind,symbol=d.name,readonly=readonly}
+        if variables:has(d.name) then
+          v=variables[d.name]
+          if v.kind ~= d.kind then fail('conflicting declaration for ' .. d.name) end
+        end
+        bind_local(d.name,v)
+      else
+        local v=allocate(d.name,d.kind,readonly)
+        if take('=') then
+          if ct.is_record(d.kind) or ct.is_array(d.kind) then
+            zero_local(d.kind, v.slot)
+          end
+          local_init(d.kind,v.slot)
+        end
+      end
+    end
+    words:destroy()
+  until not take(',')
+  prefix:destroy(); expect(';')
+end
+
+local function object_type(name: string): Id
+  if locals[name].level > 0 then return locals[name].kind end
+  return variables[name].kind
+end
+-- One translation unit per process. The driver owns temporary-file cleanup
+-- for both normal completion and diagnostics from the frontend.
+local function compile_unit(path: string, destination: string, roots: *sequence(string))
+  source_path=path
+  header_roots=roots
+  local input, reason = io.open(source_path, 'rb')
+  if not input then fail(reason) end
+  source = input:read('a')
+  if not input:close() then fail('could not close input') end
+  if #source>0 and memory.scan(source.data,0,#source)~=nilptr then fail('NUL byte in input') end
+
+  ce.object_type = object_type
+
+  local va_fields: ct.Members
+  va_fields:push({name='gp_offset', kind=Kind.UInt})
+  va_fields:push({name='fp_offset', kind=Kind.UInt})
+  va_fields:push({name='overflow_arg_area', kind=ct.pointer(Kind.Void)})
+  va_fields:push({name='reg_save_area', kind=ct.pointer(Kind.Void)})
+  va_record = ct.tag('struct', '')
+  ct.complete(va_record, &va_fields)
+  aliases['__builtin_va_list'] = ct.array(va_record, 1)
+
+  assembly:push('.text')
+  next_token()
+  while token ~= '' do
+    if inside_header then header_declaration() else decl_group(true) end
+  end
+  for i: usize=1,#tentative do
+    local v=variables[tentative[i]]
+    if not v.defined then
+      if ct.is_array(v.kind) and ct.count(v.kind) == 0 then v.kind=ct.array(ct.element(v.kind),1) end
+      if ct.size(v.kind) <= 0 then fail('incomplete tentative definition ' .. v.symbol) end
+      local out=v.readonly and &rodata or &data
+      object_start(v,out); space(out,ct.size(v.kind)); out:push('.size ' .. v.symbol .. ', .-' .. v.symbol)
+    end
+  end
+  if #data > 0 then
+    assembly:push('.data')
+    for i: usize = 1, #data do assembly:push(data[i]) end
+  end
+  if #rodata + #constants > 0 then
+    assembly:push('.section .rodata')
+    for i: usize = 1, #rodata do assembly:push(rodata[i]) end
+    for i: usize = 1, #constants do assembly:push(constants[i]) end
+  end
+  assembly:push('.section .note.GNU-stack,"",@progbits')
+
+  local output, output_error = io.open(destination, 'wb')
+  if not output then fail(output_error) end
+  local buffer: stringbuilder
+  for i: usize=1,#assembly do
+    if not buffer:write(assembly[i], '\n') then fail('out of assembly buffer memory') end
+    if #buffer >= 65536 then
+      if not output:write(buffer:view()) then fail('could not write assembly') end
+      buffer:clear()
+    end
+  end
+  if #buffer>0 and not output:write(buffer:view()) then fail('could not write assembly') end
+  if not output:close() then fail('could not close assembly') end
+  buffer:destroy()
+end
+
+if #arg >= 3 and arg[1] == '--cc1' then
+  local roots: sequence(string)
+  for i: usize=4,#arg do roots:push(arg[i]) end
+  compile_unit(arg[2],arg[3],&roots)
+else
+  driver.run(compile_unit)
+end

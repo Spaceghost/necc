@@ -1,0 +1,383 @@
+-- Evaluate integer constant expressions using the target widths and C promotions.
+require 'hashmap'
+require 'sequence'
+require 'string'
+
+local ct = require 'ctypes'
+local Id, K = ct.Id, ct.Kind
+local ce = @record{}
+global ce.Names = @hashmap(string, integer)
+local Names = ce.Names
+global ce.Tokens = @sequence(string)
+local Tokens = ce.Tokens
+local Cursor = @record{words: *Tokens, at: usize, last: usize, names: *Names, pending: *Names, aliases: *ct.Aliases, unevaluated: boolean}
+-- The declaration parser supplies the shared resolver for casts and sizeof.
+global ce.object_type: function(name: string): Id
+global ce.resolve_type: function(words: *Tokens, aliases: *ct.Aliases, names: *Names): Id
+local Value = @record{n: integer, kind: Id, ok: boolean}
+
+-- Select the first representable type allowed by the spelling and base (LP64).
+function ce.literal(word: string): (integer, Id, string)
+  local length = #word
+  if length == 0 or word:byte(1) < 48 or word:byte(1) > 57 then return 0,K.Unknown,'expected integer constant' end
+  local radix: uint64 = 10
+  local i: usize = 1
+  if word:byte(1) == 48 then
+    radix=8
+    if length >= 2 and (word:byte(2) == 120 or word:byte(2) == 88) then radix=16; i=3 end
+  end
+  local first=i
+  local n: uint64=0
+  while i <= length do
+    local c=word:byte(i)
+    local d: uint64
+    if c >= 48 and c <= 57 then d=c-48
+    elseif c >= 65 and c <= 70 then d=c-55
+    elseif c >= 97 and c <= 102 then d=c-87
+    else break end
+    if d >= radix then return 0,K.Unknown,'invalid digit in integer constant' end
+    if n > (0xffffffffffffffff_u64-d)//radix then return 0,K.Unknown,'integer constant out of range' end
+    n=n*radix+d; i=i+1
+  end
+  if i == first then return 0,K.Unknown,'expected digits in integer constant' end
+  local u,l,ll=false,false,false
+  if i<=length then
+    local first_u=(word.data[i-1] | 32)==117
+    if first_u then u=true; i=i+1 end
+    if i<=length and (word.data[i-1] | 32)==108 then
+      local letter=word.data[i-1]
+      l=true; i=i+1
+      if i<=length and (word.data[i-1] | 32)==108 then
+        if word.data[i-1]~=letter then return 0,K.Unknown,'invalid long long suffix' end
+        ll=true; i=i+1
+      end
+    end
+    if not first_u and i<=length and (word.data[i-1] | 32)==117 then u=true; i=i+1 end
+    if i<=length then return 0,K.Unknown,'unsupported integer constant suffix' end
+  end
+  local k: Id
+  if not l and not u and n <= 2147483647 then k=K.Int
+  elseif not l and (u or radix ~= 10) and n <= 4294967295 then k=K.UInt
+  elseif not u and n <= 9223372036854775807 then k=ll and K.LLong or K.Long
+  elseif u or radix ~= 10 then k=ll and K.ULLong or K.ULong
+  else return 0,K.Unknown,'integer constant out of range' end
+  return (@integer)(n),k,''
+end
+
+local function peek(c: *Cursor): string
+  if c.at > c.last then return '' end
+  return ($c.words)[c.at]
+end
+
+local function take(c: *Cursor, word: string): boolean
+  if peek(c) ~= word then return false end
+  c.at=c.at+1; return true
+end
+
+local function value(n: integer,k: Id): Value
+  if k == K.Bool then n=n ~= 0 and 1 or 0
+  elseif k == K.Char or k == K.SChar then n=(@int8)(n)
+  elseif k == K.UChar then n=(@uint8)(n)
+  elseif k == K.Short then n=(@int16)(n)
+  elseif k == K.UShort then n=(@uint16)(n)
+  elseif k == K.Int then n=(@int32)(n)
+  elseif k == K.UInt then n=(@uint32)(n) end
+  return {n=n,kind=k,ok=true}
+end
+
+local function priority(op: string): integer
+  if op == '||' then return 2 elseif op == '&&' then return 3
+  elseif op == '|' then return 4 elseif op == '^' then return 5 elseif op == '&' then return 6
+  elseif op == '==' or op == '!=' then return 7
+  elseif op == '<' or op == '<=' or op == '>' or op == '>=' then return 8
+  elseif op == '<<' or op == '>>' then return 9
+  elseif op == '+' or op == '-' then return 10
+  elseif op == '*' or op == '/' or op == '%' then return 11 end
+  return 0
+end
+
+local function expression(c: *Cursor,minimum: integer): Value <forwarddecl> end
+
+function ce.bytes(s: string, bytes: *sequence(byte)): string
+  local i: usize = 2
+  while i < #s do
+    local c = s:byte(i); i = i+1
+    if c == 92 then
+      local esc = s:byte(i); i = i+1
+      if esc >= 48 and esc <= 55 then
+        local n = (@integer)(esc-48)
+        for j=1,2 do
+          local ch=s:byte(i)
+          if ch < 48 or ch > 55 then break end
+          n=n*8+ch-48; i=i+1
+        end
+        c=(@byte)(n)
+      elseif esc == 120 then
+        local n: byte = 0
+        local first = i
+        while i < #s do
+          local ch=s:byte(i)
+          if ch >= 48 and ch <= 57 then ch=ch-48
+          elseif ch >= 97 and ch <= 102 then ch=ch-87
+          elseif ch >= 65 and ch <= 70 then ch=ch-55
+          else break end
+          n=(@byte)(n*16+ch); i=i+1
+        end
+        if i == first then return 'missing hex escape digits' end
+        c=n
+      elseif esc == 97 then c=7 elseif esc == 98 then c=8 elseif esc == 102 then c=12
+      elseif esc == 110 then c=10 elseif esc == 114 then c=13 elseif esc == 116 then c=9
+      elseif esc == 118 then c=11 elseif esc == 63 or esc == 92 or esc == 34 or esc == 39 then c=esc
+      else return 'unsupported literal escape' end
+    end
+    bytes:push(c)
+  end
+  return ''
+end
+
+function ce.character(word: string): (integer,boolean)
+  local bytes: sequence(byte)
+  local why=ce.bytes(word,&bytes)
+  if #why > 0 or #bytes == 0 or #bytes > 4 then return 0,false end
+  local n: integer=0
+  if #bytes == 1 then n=(@int8)(bytes[1])
+  else for i: usize=1,#bytes do n=(n << 8) | bytes[i] end end
+  bytes:destroy()
+  return (@int32)(n),true
+end
+
+-- On failure the caller can still parse a parenthesized expression.
+local function type_operand(c: *Cursor, delimiter: string): Id
+  local words: Tokens
+  local depth: integer = 0
+  local at = c.at
+  while at <= c.last do
+    local word = ($c.words)[at]
+    if depth == 0 and word == delimiter then break end
+    if word == '(' then depth = depth + 1
+    elseif word == ')' then
+      if depth == 0 then break end
+      depth = depth - 1
+    end
+    words:push(word)
+    at = at + 1
+  end
+  local kind: Id = K.Unknown
+  if #words > 0 and at <= c.last and ($c.words)[at] == delimiter then
+    kind = ce.resolve_type(&words, c.aliases, c.names)
+    if kind ~= K.Unknown then c.at = at + 1 end
+  end
+  words:destroy()
+  return kind
+end
+
+local function field_offset(c: *Cursor): Value
+  if not take(c, '(') then return {} end
+  local kind = type_operand(c, ',')
+  local offset: integer = 0
+  repeat
+    local field, displacement = ct.member(kind, peek(c))
+    if field == K.Unknown then return {} end
+    c.at = c.at + 1
+    kind, offset = field, offset + displacement
+    while take(c, '[') do
+      if not ct.is_array(kind) then return {} end
+      local index = expression(c, 1)
+      if not index.ok or not take(c, ']') then return {} end
+      kind = ct.element(kind)
+      offset = offset + index.n * ct.size(kind)
+    end
+  until not take(c, '.')
+  if not take(c, ')') then return {} end
+  return value(offset, K.ULong)
+end
+
+local function primary(c: *Cursor): Value
+  local w=peek(c)
+  if #w == 0 then return {} end
+  c.at=c.at+1
+  if w:byte(1) == 39 then
+    local n,ok=ce.character(w)
+    if not ok then return {} end
+    return value(n,K.Int)
+  elseif w == '__builtin_offsetof' then return field_offset(c)
+  elseif w == 'sizeof' or w == '_Alignof' then
+    if not take(c, '(') then return {} end
+    local k = type_operand(c, ')')
+    if k == K.Unknown and w == 'sizeof' then
+      if c.at < c.last and ($c.words)[c.at + 1] == ')' and ce.object_type(peek(c)) ~= K.Unknown then
+        k = ce.object_type(peek(c))
+        c.at = c.at + 1
+      elseif #peek(c) > 0 and peek(c):byte(1) == 34 then
+        local bytes: sequence(byte)
+        repeat
+          local problem = ce.bytes(peek(c), &bytes)
+          if #problem > 0 then return {} end
+          c.at = c.at + 1
+        until #peek(c) == 0 or peek(c):byte(1) ~= 34
+        k = ct.array(K.Char, (@integer)(#bytes) + 1)
+        bytes:destroy()
+      else
+        local v = expression(c, 1)
+        if not v.ok then return {} end
+        k = v.kind
+      end
+      if not take(c, ')') then return {} end
+    end
+    local n = w == 'sizeof' and ct.size(k) or ct.align(k)
+    if n <= 0 then return {} end
+    return value(n, K.ULong)
+  elseif w == '(' then
+    local kind = type_operand(c, ')')
+    if kind ~= K.Unknown then
+      if not ct.is_integer(kind) then return {} end
+      local v = primary(c)
+      if not v.ok then return {} end
+      return value(v.n, kind)
+    end
+    local v=expression(c,1)
+    if not take(c,')') then return {} end
+    return v
+  elseif w == '+' or w == '-' or w == '~' or w == '!' then
+    local a=primary(c); if not a.ok then return {} end
+    local k=ct.promote(a.kind)
+    if w == '!' then return value(a.n == 0 and 1 or 0,K.Int)
+    elseif w == '~' then return value(~a.n,k)
+    elseif w == '-' then
+      if not c.unevaluated and not ct.unsigned(k) and a.n == (ct.size(k) == 8 and (-9223372036854775807-1) or -2147483648) then return {} end
+      return value((@integer)(0_u64-(@uint64)(a.n)),k)
+    end
+    return value(a.n,k)
+  elseif c.pending ~= nilptr and ($c.pending):has(w) then return value(($c.pending)[w],K.Int)
+  elseif ($c.names):has(w) then return value(($c.names)[w],K.Int) end
+  local n,k,reason=ce.literal(w)
+  if #reason ~= 0 then return {} end
+  return value(n,k)
+end
+
+local function magnitude(n: integer): uint64
+  return n < 0 and (0_u64-(@uint64)(n)) or (@uint64)(n)
+end
+
+local function apply(op: string,a: Value,b: Value): Value
+  local shift=op == '<<' or op == '>>'
+  local k=shift and ct.promote(a.kind) or ct.common(a.kind,b.kind)
+  a=value(a.n,k)
+  if not shift then b=value(b.n,k) end
+  local ua,ub=(@uint64)(a.n),(@uint64)(b.n)
+  local unsigned=ct.unsigned(k)
+  local maximum=ct.size(k) == 8 and 9223372036854775807_i64 or 2147483647_i64
+  if op == '|' then return value(a.n | b.n,k) elseif op == '^' then return value(a.n ~ b.n,k)
+  elseif op == '&' then return value(a.n & b.n,k) end
+  if shift then
+    if b.n < 0 or b.n >= ct.size(k)*8 then return {} end
+    if op == '<<' then
+      if not unsigned and (a.n < 0 or a.n > (maximum >> b.n)) then return {} end
+      return value((@integer)(ua << b.n),k)
+    end
+    if not unsigned and a.n < 0 then return value(~((~a.n) >> b.n),k) end
+    return value((@integer)(ua >> b.n),k)
+  elseif op == '+' or op == '-' then
+    local r=value((@integer)(op == '+' and ua+ub or ua-ub),k)
+    if not unsigned and ((op == '+') == ((a.n < 0) == (b.n < 0))) and (r.n < 0) ~= (a.n < 0) then return {} end
+    return r
+  elseif op == '*' then
+    if not unsigned and b.n ~= 0 then
+      local limit=(@uint64)(maximum)+(((a.n < 0) ~= (b.n < 0)) and 1_u64 or 0_u64)
+      if magnitude(a.n) > limit//magnitude(b.n) then return {} end
+    end
+    return value((@integer)(ua*ub),k)
+  elseif op == '/' or op == '%' then
+    if b.n == 0 or (not unsigned and a.n == -maximum-1 and b.n == -1) then return {} end
+    if unsigned then return value((@integer)(op == '/' and ua//ub or ua%ub),k) end
+    local x,y=magnitude(a.n),magnitude(b.n)
+    local result=op == '/' and x//y or x%y
+    if (op == '/' and ((a.n < 0) ~= (b.n < 0))) or (op == '%' and a.n < 0) then result=0_u64-result end
+    return value((@integer)(result),k)
+  end
+  local eq=a.n == b.n
+  local lt:boolean
+  if unsigned then lt=ua < ub else lt=a.n < b.n end
+  local yes=(op == '==' and eq) or (op == '!=' and not eq) or (op == '<' and lt) or
+    (op == '<=' and (lt or eq)) or (op == '>' and not (lt or eq)) or (op == '>=' and not lt)
+  return value(yes and 1 or 0,K.Int)
+end
+
+function expression(c: *Cursor, minimum: integer): Value
+  local lhs = primary(c)
+  while lhs.ok do
+    local op = peek(c)
+    local p = priority(op)
+    if p < minimum then break end
+    c.at = c.at + 1
+    local outer = c.unevaluated
+    if (op == '&&' and lhs.n == 0) or (op == '||' and lhs.n ~= 0) then c.unevaluated = true end
+    local rhs = expression(c, p + 1)
+    c.unevaluated = outer
+    if not rhs.ok then return {} end
+    if op == '&&' then lhs = value(lhs.n ~= 0 and rhs.n ~= 0 and 1 or 0, K.Int)
+    elseif op == '||' then lhs = value((lhs.n ~= 0 or rhs.n ~= 0) and 1 or 0, K.Int)
+    elseif outer then
+      local result: Id = ct.common(lhs.kind, rhs.kind)
+      if p == 7 or p == 8 then result = K.Int
+      elseif p == 9 then result = ct.promote(lhs.kind) end
+      lhs = value(0, result)
+    else lhs = apply(op, lhs, rhs) end
+  end
+  if minimum == 1 and lhs.ok and take(c, '?') then
+    local outer = c.unevaluated
+    c.unevaluated = outer or lhs.n == 0
+    local yes = expression(c, 1)
+    if not take(c, ':') then return {} end
+    c.unevaluated = outer or lhs.n ~= 0
+    local no = expression(c, 1)
+    c.unevaluated = outer
+    if not yes.ok or not no.ok then return {} end
+    return value(lhs.n ~= 0 and yes.n or no.n, ct.common(yes.kind, no.kind))
+  end
+  return lhs
+end
+
+function ce.evaluate(words: *Tokens, names: *Names, aliases: *ct.Aliases): (integer, boolean, Id)
+  local c: Cursor = {words=words, at=1, last=#($words), names=names, aliases=aliases}
+  local v = expression(&c, 1)
+  return v.n, v.ok and c.at > c.last, v.kind
+end
+
+local function identifier(word: string): boolean
+  if #word == 0 then return false end
+  local ch = word:byte(1)
+  return ch == 95 or (ch >= 65 and ch <= 90) or (ch >= 97 and ch <= 122)
+end
+
+-- Publish enumerators together. Unsupported header declarations must never
+-- leave guessed values or an incomplete enumeration in the symbol table.
+function ce.enumeration(words: *Tokens, names: *Names, pending: *Names, aliases: *ct.Aliases): boolean
+  local c: Cursor = {words = words, at = 1, last = #($words), names = names, pending = pending, aliases = aliases}
+  local alias = take(&c, 'typedef')
+  if not take(&c, 'enum') then return false end
+  if identifier(peek(&c)) then c.at = c.at + 1 end
+  if not take(&c, '{') then return false end
+  local next_n: integer = 0
+  repeat
+    local name = peek(&c)
+    if not identifier(name) or ($pending):has(name) or ($names):has(name) then return false end
+    c.at = c.at + 1
+    if take(&c, '=') then
+      local v = expression(&c, 1)
+      if not v.ok then return false end
+      next_n = v.n
+    end
+    if next_n < -2147483648 or next_n > 2147483647 then return false end
+    ($pending)[name] = next_n
+    next_n = next_n + 1
+  until not take(&c, ',') or peek(&c) == '}'
+  if not take(&c, '}') then return false end
+  if alias then
+    if not identifier(peek(&c)) then return false end
+    c.at = c.at + 1
+  end
+  return c.at > c.last
+end
+
+return ce

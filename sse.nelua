@@ -1,0 +1,38 @@
+-- The bootstrap assembler lacks scalar SSE arithmetic mnemonics. Encode this small
+-- register-only subset directly. Leave the mnemonic in the assembly for inspection.
+require 'string'
+local ct = require 'ctypes'
+local sse = @record{}
+
+local function instruction(prefix: string, rex: string, opcode: integer,
+                           reg: integer, rm: integer, mnemonic: string): string
+  return '.byte ' .. prefix .. rex .. '0x0f,' .. tostring(opcode) .. ',' ..
+         tostring(0xc0 + 8*reg + rm) .. ' # ' .. mnemonic
+end
+
+local function prefix(k: ct.Id): string return k == ct.Kind.Float and '0xf3,' or '0xf2,' end
+local function suffix(k: ct.Id): string return k == ct.Kind.Float and 'ss' or 'sd' end
+
+function sse.arithmetic(k: ct.Id, op: string, src: integer, dst: integer): string
+  local opcode = op == 'add' and 0x58 or (op == 'sub' and 0x5c or (op == 'mul' and 0x59 or 0x5e))
+  return instruction(prefix(k), '', opcode, dst, src,
+                     op .. suffix(k) .. ' %xmm' .. tostring(src) .. ', %xmm' .. tostring(dst))
+end
+
+function sse.compare(k: ct.Id, src: integer, dst: integer): string
+  local p = k == ct.Kind.Double and '0x66,' or ''
+  return instruction(p, '', 0x2e, dst, src,
+                     'ucomi' .. suffix(k) .. ' %xmm' .. tostring(src) .. ', %xmm' .. tostring(dst))
+end
+
+function sse.convert(from: ct.Id, into: ct.Id): string
+  if ct.floating(from) and ct.floating(into) then
+    return instruction(prefix(from), '', 0x5a, 0, 0, 'cvt' .. suffix(from) .. '2' .. suffix(into) .. ' %xmm0, %xmm0')
+  elseif ct.floating(into) then
+    return instruction(prefix(into), '0x48,', 0x2a, 0, 0, 'cvtsi2' .. suffix(into) .. 'q %rax, %xmm0')
+  else
+    return instruction(prefix(from), '0x48,', 0x2c, 0, 0, 'cvtt' .. suffix(from) .. '2siq %xmm0, %rax')
+  end
+end
+
+return sse

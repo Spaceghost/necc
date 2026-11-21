@@ -1,0 +1,370 @@
+-- Linux command driver for the distro's C, Nelua and Lua entry points.
+require 'arg'
+require 'io'
+require 'os'
+require 'sequence'
+require 'string'
+
+local driver = @record{}
+local function fork(): cint <cimport, cinclude '<unistd.h>'> end
+local function execv(path: cstring, argv: *[0]cstring): cint <cimport, cinclude '<unistd.h>'> end
+local function waitpid(pid: cint, status: *cint, flags: cint): cint <cimport, cinclude '<sys/wait.h>'> end
+local function mkdtemp(pattern: *[0]cchar): *[0]cchar <cimport, cinclude '<stdlib.h>'> end
+local function rmdir(path: cstring): cint <cimport, cinclude '<unistd.h>'> end
+local function open(path: cstring, flags: cint): cint <cimport, cinclude '<fcntl.h>'> end
+local function dup2(oldfd: cint, newfd: cint): cint <cimport, cinclude '<unistd.h>'> end
+local function close(fd: cint): cint <cimport, cinclude '<unistd.h>'> end
+local O_RDONLY: cint <cimport, nodecl, cinclude '<fcntl.h>'>
+local function access(path: cstring, mode: cint): cint <cimport, cinclude '<unistd.h>'> end
+local Stat: type <cimport 'necc_stat', cinclude '<sys/stat.h>', nodecl, ctypedef 'stat'> = @record{
+  st_dev: culong, st_ino: culong
+}
+local function stat(path: cstring, info: *Stat): cint <cimport, cinclude '<sys/stat.h>'> end
+local function setenv(name: cstring, value: cstring, replace: cint): cint <cimport, cinclude '<stdlib.h>'> end
+local function _exit(status: cint): void <cimport, cinclude '<unistd.h>', noreturn> end
+local function nelibc_errno_location(): *cint <cimport, cinclude '<errno.h>'> end
+local EINTR: cint <cimport, nodecl, cinclude '<errno.h>'>
+
+local Args = @sequence(string)
+local NeluaMode = @enum{Full=0, Direct, Native}
+local files: Args
+local dirs: Args
+function driver.finish(code: integer): void <noreturn>
+  for i: usize = 1, #files do os.remove(files[i]) end
+  for i = (@integer)(#dirs), 1, -1 do rmdir(dirs[i]) end
+  os.exit(code)
+end
+
+local function die(message: string): void <noreturn>
+  io.stderr:write('necc: ' .. message .. '\n')
+  driver.finish(1)
+end
+
+local function env(name: string, fallback: string): string
+  local value = os.getenv(name)
+  return #value > 0 and value or fallback
+end
+
+local function directory(parent: string): string
+  local path = parent .. '/.necc-XXXXXX'
+  if mkdtemp((@*[0]cchar)(path.data)) == nilptr then
+    die('cannot create a temporary directory in ' .. parent)
+  end
+  dirs:push(path)
+  return path
+end
+
+local function temporary(dir: string, name: string): string
+  local path = dir .. '/' .. name
+  files:push(path)
+  return path
+end
+
+local function parent(path: string): string
+  for i = (@integer)(#path), 1, -1 do
+    if path:byte(i) == 47 then return i == 1 and '/' or path:sub(1, i - 1) end
+  end
+  return '.'
+end
+
+local function execute(path: string, arguments: *Args): void <noreturn>
+  local argv: sequence(cstring)
+  argv:push((@cstring)(path))
+  for i: usize = 1, #($arguments) do argv:push((@cstring)(($arguments)[i])) end
+  argv:push(nilptr)
+  execv(path, (@*[0]cstring)(&argv[1]))
+  io.stderr:write('necc: cannot execute ' .. path .. '\n')
+  _exit(127)
+end
+
+local function run(path: string, arguments: Args, input: facultative(string))
+  local pid = fork()
+  if pid < 0 then die('fork failed') end
+  if pid == 0 then
+    ## if input.type.is_string then
+    local fd = open(input, O_RDONLY)
+    if fd < 0 or dup2(fd, 0) < 0 then
+      io.stderr:write('necc: cannot read ' .. input .. '\n')
+      _exit(1)
+    end
+    if fd ~= 0 then close(fd) end
+    ## end
+    execute(path, &arguments)
+  end
+  local status: cint
+  while waitpid(pid, &status, 0) < 0 do
+    if $nelibc_errno_location() ~= EINTR then die('waitpid failed') end
+  end
+  if (status & 127) ~= 0 then driver.finish(128 + (status & 127)) end
+  if status ~= 0 then driver.finish((status >> 8) & 255) end
+end
+
+local function usage()
+  io.stdout:write('usage: necc [-S|-c|-E|--emit-c] [--native|--direct] [-I DIR] [-isystem DIR] [-D NAME] FILE [-o OUTPUT]\n' ..
+      '       necc SOURCE|OBJECT|ARCHIVE ... [-o PROGRAM]\n' ..
+      '       necc [--native] [--release] [-L DIR] [--define EXPR] FILE.nelua [-o OUTPUT]\n' ..
+      '       necc SCRIPT.lua [ARG ...] | necc --lua [LUA-OPTION ...]\n' ..
+      'C uses the native necc frontend. --native compiles full-frontend Nelua output through it.\n' ..
+      '--direct selects the self-hosted Nelua subset frontend and native C compiler.\n' ..
+      'Set NECC_NELINKER to the executable path to select the final static linker.\n')
+end
+
+local function extension(path: string): string
+  for i = (@integer)(#path), 1, -1 do
+    local c = path:byte(i)
+    if c == 46 then return path:sub(i) end
+    if c == 47 then break end
+  end
+  return ''
+end
+
+local function safe_path(path: string): string
+  return path:sub(1, 1) == '-' and './' .. path or path
+end
+
+local function protect_input(input: string, destination: string)
+  local src: Stat
+  local dst: Stat
+  if input == destination or (stat(input, &src) == 0 and stat(destination, &dst) == 0 and
+      src.st_dev == dst.st_dev and src.st_ino == dst.st_ino) then
+    die('input and output refer to the same file')
+  end
+end
+
+local function link_objects(sdk: string, objects: *Args, result: string)
+  local linker = os.getenv('NECC_NELINKER')
+  local native = #linker > 0
+  local args: Args
+  if native then
+    -- This SDK's TinyCC assembler retains part of some addends in the field.
+    args:push('--tcc-relocs')
+    args:push('-e'); args:push('_start')
+  else
+    linker = sdk .. '/tcc/tcc'
+    args:push('-B' .. sdk .. '/tcc')
+    args:push('-nostdlib'); args:push('-static'); args:push('-Wl,-e,_start')
+  end
+  for i: usize = 1, #($objects) do args:push(($objects)[i]) end
+  args:push(native and '--whole-archive' or '-Wl,--whole-archive')
+  args:push(sdk .. '/libnelibc.a')
+  args:push(native and '--no-whole-archive' or '-Wl,--no-whole-archive')
+  args:push(sdk .. '/tcc/libtcc1.a')
+  args:push('-o')
+  args:push(result)
+  run(linker, args)
+end
+
+-- Compile independent translation units through the same -c path used by
+-- nebuild. Object and archive order is significant to the static linker.
+local function link_program(inputs: *Args, output: string, sdk: string, backend: NeluaMode,
+                            cpp: *Args, roots: *Args, nelua: *Args): void <noreturn>
+  local work = directory(env('TMPDIR', '/tmp'))
+  local result = temporary(directory(parent(output)), 'program')
+  local objects: Args
+  local has_nelua = false
+  local has_cpp = false
+  for i: usize = 1, #($inputs) do
+    local file = ($inputs)[i]
+    protect_input(file, output)
+    local ext = extension(file)
+    if ext == '.o' or ext == '.a' then
+      objects:push(file)
+    elseif ext == '.c' or ext == '.i' or ext == '.s' or ext == '.nelua' then
+      local object = temporary(work, 'unit-' .. tostring(i) .. '.o')
+      local args: Args = {'-c', '-o', object}
+      if ext ~= '.s' then
+        has_cpp = true
+        for k: usize = 1, #($cpp) do args:push(($cpp)[k]) end
+        for k: usize = 1, #($roots) do args:push('-isystem'); args:push(($roots)[k]) end
+      end
+      if ext == '.nelua' then
+        has_nelua = true
+        if backend == NeluaMode.Direct then args:push('--direct')
+        elseif backend == NeluaMode.Native then args:push('--native') end
+        for k: usize = 1, #($nelua) do args:push(($nelua)[k]) end
+      end
+      args:push('--')
+      args:push(file)
+      run('/proc/self/exe', args)
+      args:destroy()
+      objects:push(object)
+    else
+      die('unknown input language for ' .. file)
+    end
+  end
+  if not has_nelua and (backend ~= NeluaMode.Full or #($nelua) > 0) then die('Nelua options require a Nelua input') end
+  if not has_cpp and #($cpp) + #($roots) > 0 then die('preprocessor options require a source input') end
+  link_objects(sdk, &objects, result)
+  if not os.rename(result, output) then die('cannot install ' .. output) end
+  driver.finish(0)
+end
+
+function driver.run(frontend: function(string,string,*Args)): void <noreturn>
+  if #arg == 0 then usage(); driver.finish(2) end
+  if arg[1] == '--help' or arg[1] == '-h' then usage(); driver.finish(0) end
+  local sdk = env('NECC_SYSROOT', '/usr/lib/necc')
+  local lua = sdk .. '/nelua-lua'
+  if arg[1] == '--lua' or extension(arg[1]) == '.lua' then
+    local arguments: Args
+    if arg[1] ~= '--lua' then arguments:push(safe_path(arg[1])) end
+    for i: usize = 2, #arg do arguments:push(arg[i]) end
+    execute(lua, &arguments)
+  end
+
+  local inputs: Args
+  local destination: string
+  local mode: string
+  local backend: NeluaMode = NeluaMode.Full
+  local options: Args
+  local system_dirs: Args
+  local frontend_options: Args
+  local i: usize = 1
+  local positional = false
+  while i <= #arg do
+    local option = arg[i]
+    if not positional and option == '--' then
+      positional = true
+    elseif not positional and option == '-o' then
+      i = i + 1
+      if i > #arg or #destination > 0 then die('expected one output after -o') end
+      destination = arg[i]
+    elseif not positional and (option == '-S' or option == '-c' or option == '-E' or option == '--emit-c') then
+      if #mode > 0 then die('choose one output mode') end
+      mode = option
+    elseif not positional and (option == '--direct' or option == '--native') then
+      local requested = option == '--direct' and NeluaMode.Direct or NeluaMode.Native
+      if backend ~= NeluaMode.Full and backend ~= requested then die('choose one Nelua backend') end
+      backend = requested
+    elseif not positional and (option == '-r' or option == '--release') then
+      frontend_options:push('--release')
+    elseif not positional and (option == '-L' or option == '--add-path' or option == '--define') then
+      i = i + 1
+      if i > #arg then die('missing argument after ' .. option) end
+      frontend_options:push(option)
+      frontend_options:push(arg[i])
+    elseif not positional and option == '-isystem' then
+      i = i + 1
+      if i > #arg or #arg[i] == 0 then die('missing directory after -isystem') end
+      system_dirs:push(arg[i])
+    elseif not positional and (option:sub(1, 2) == '-I' or option:sub(1, 2) == '-D' or option:sub(1, 2) == '-U') then
+      if #option == 2 then
+        i = i + 1
+        if i > #arg then die('missing argument to ' .. option) end
+        option = option .. arg[i]
+      end
+      options:push(option)
+    elseif not positional and option:sub(1, 1) == '-' then
+      die('unknown option ' .. option)
+    else
+      inputs:push(safe_path(option))
+    end
+    i = i + 1
+  end
+  if #inputs == 0 then die('missing input file') end
+  local input = inputs[1]
+  local ext = extension(input)
+  if #inputs > 1 or ext == '.a' then
+    if #mode > 0 or extension(destination) == '.s' then die('multiple inputs and archives require executable linking') end
+    if #destination == 0 then destination = 'a.out' end
+    link_program(&inputs, destination, sdk, backend, &options, &system_dirs, &frontend_options)
+  end
+  local nelua = ext == '.nelua'
+  local direct = backend == NeluaMode.Direct
+  if not nelua and ext ~= '.c' and ext ~= '.i' and ext ~= '.s' and ext ~= '.o' then die('unknown input language for ' .. input) end
+  if #frontend_options > 0 and (not nelua or direct) then die('Nelua frontend options require a full Nelua input') end
+  if backend ~= NeluaMode.Full and not nelua then die('Nelua backend options require a Nelua input') end
+  if mode == '--emit-c' and not nelua then die('--emit-c needs a Nelua input') end
+  if #mode == 0 and #destination > 0 and extension(destination) == '.s' then mode = '-S' end
+  if nelua and mode == '-S' and backend == NeluaMode.Full then die('use --native or --direct to emit Nelua assembly') end
+  if (ext == '.s' or ext == '.o') and (#options + #system_dirs > 0 or mode == '-S' or mode == '-E' or (mode == '-c' and ext == '.o')) then die('incompatible options for ' .. ext) end
+  if #destination == 0 then
+    if #mode == 0 then
+      destination = 'a.out'
+    else
+      local suffix: string = '.c'
+      if mode == '-c' then suffix = '.o'
+      elseif mode == '-S' then suffix = '.s'
+      elseif mode == '-E' then suffix = '.i' end
+      destination = input:sub(1, #input - #ext) .. suffix
+    end
+  end
+  protect_input(input, destination)
+  local tcc = sdk .. '/tcc/tcc'
+  -- Keep the original preprocessed-C to assembly invocation usable with just necc.
+  if mode == '-S' and (ext == '.i' or (ext == '.c' and #options + #system_dirs == 0 and access(tcc, 1) ~= 0)) then
+    local publish = temporary(directory(parent(destination)), 'result')
+    frontend(input, publish, &system_dirs)
+    if not os.rename(publish, destination) then die('cannot install ' .. destination) end
+    driver.finish(0)
+  end
+  local work = directory(env('TMPDIR', '/tmp'))
+  local result = temporary(directory(parent(destination)), mode == '--emit-c' and 'result.c' or 'result')
+  local c_input = input
+  if nelua then
+    c_input = mode == '--emit-c' and result or temporary(work, 'input.c')
+    if direct then
+      if setenv('NLC_INPUT', input, 1) ~= 0 or setenv('NLC_OUTPUT', c_input, 1) ~= 0 then die('cannot set frontend paths') end
+      run(sdk .. '/nlc', {})
+    else
+      -- The fork's frontend takes a shell command for --cc, including its quoting.
+      local quoted = "'" .. tcc:gsub("'", "'\\''") .. "'"
+      local args: Args = {'-lnelua', 'nelua.lua', '--cc', quoted, '--cache-dir', work}
+      for k: usize = 1, #frontend_options do args:push(frontend_options[k]) end
+      args:push('-c')
+      args:push('-o')
+      args:push(c_input)
+      args:push(input)
+      run(lua, args)
+    end
+  end
+  if mode ~= '--emit-c' then
+    local flags: Args = {'-B' .. sdk .. '/tcc', '-nostdinc', '-std=c11', '-DNELIBC_STANDALONE'}
+    for k: usize = 1, #options do flags:push(options[k]) end
+    for k: usize = 1, #system_dirs do
+      flags:push('-isystem')
+      flags:push(system_dirs[k])
+    end
+    flags:push('-I' .. sdk .. '/include')
+    flags:push('-I' .. sdk .. '/tcc/include')
+    flags:push('-I' .. sdk .. '/uapi')
+    local obj = input
+    if ext ~= '.o' then
+      obj = mode == '-c' and result or temporary(work, 'input.o')
+      if nelua and backend == NeluaMode.Full and mode ~= '-E' then
+        flags:push('-c'); flags:push(c_input); flags:push('-o'); flags:push(obj)
+        run(tcc, flags)
+      else
+        local preprocessed = c_input
+        if ext ~= '.s' and (ext ~= '.i' or mode == '-E') then
+          preprocessed = mode == '-E' and result or temporary(work, 'input.i')
+          flags:push('-E'); flags:push('-o'); flags:push(preprocessed); flags:push(c_input)
+          run(tcc, flags)
+        end
+        if mode ~= '-E' then
+          local asm = input
+          if ext ~= '.s' then
+            asm = mode == '-S' and result or temporary(work, 'input.s')
+            frontend(preprocessed, asm, &system_dirs)
+          end
+          if mode ~= '-S' then
+            if ext == '.s' then
+              run(tcc, {'-B' .. sdk .. '/tcc', '-c', asm, '-o', obj})
+            else
+              -- TinyCC records its input path in ELF's FILE symbol. A private
+              -- scratch name would make equal C inputs produce unequal objects.
+              run(tcc, {'-B' .. sdk .. '/tcc', '-x', 'assembler', '-c', '-', '-o', obj}, asm)
+            end
+          end
+        end
+      end
+    end
+    if #mode == 0 then
+      local objects: Args = {obj}
+      link_objects(sdk, &objects, result)
+    end
+  end
+  if not os.rename(result, destination) then die('cannot install ' .. destination) end
+  driver.finish(0)
+end
+
+return driver

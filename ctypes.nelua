@@ -1,0 +1,203 @@
+-- Types and layout for the x86-64 System V LP64 target.
+require 'hashmap'
+require 'sequence'
+require 'string'
+
+local ct = @record{}
+global ct.Id = @integer
+local Id = ct.Id
+global ct.Aliases = @hashmap(string, Id)
+global ct.Kind = @enum{Unknown=0, Void, Bool, Char, SChar, UChar, Short, UShort,
+                       Int, UInt, Long, ULong, LLong, ULLong, Float, Double, LongDouble}
+local K = ct.Kind
+
+global ct.Signature = @record{
+  arity: integer, defined: boolean, internal: boolean, variadic: boolean,
+  unspecified: boolean, result: Id, parameters: sequence(Id)
+}
+global ct.Member = @record{name: string, kind: Id, offset: integer}
+global ct.Members = @sequence(ct.Member)
+
+local Form = @enum{Pointer=0, Record, Union, Function, Array}
+local Descriptor = @record{
+  form: Form, element: Id, size: integer, alignment: integer,
+  count: integer, signature: ct.Signature, members: ct.Members
+}
+local derived: sequence(Descriptor)
+local pointers: hashmap(Id, Id)
+local tags: hashmap(string, Id)
+local functions: hashmap(string, Id)
+local arrays: hashmap(string, Id)
+local last_builtin: Id = K.LongDouble
+
+local function register(item: Descriptor): Id
+  derived:push(item)
+  return last_builtin + (@Id)(#derived)
+end
+
+local function form(t: Id, want: Form): boolean
+  return t > last_builtin and derived[t-last_builtin].form == want
+end
+
+function ct.is_pointer(t: Id): boolean return form(t, Form.Pointer) end
+function ct.is_record(t: Id): boolean return form(t, Form.Record) or form(t, Form.Union) end
+function ct.is_union(t: Id): boolean return form(t, Form.Union) end
+function ct.is_function(t: Id): boolean return form(t, Form.Function) end
+function ct.is_array(t: Id): boolean return form(t, Form.Array) end
+function ct.is_integer(t: Id): boolean return t >= K.Bool and t <= K.ULLong end
+
+function ct.floating(t: Id): boolean return t == K.Float or t == K.Double end
+
+function ct.unsigned(t: Id): boolean
+  return t == K.Bool or t == K.UChar or t == K.UShort or t == K.UInt or t == K.ULong or t == K.ULLong
+end
+
+function ct.size(t: Id): integer
+  if t > last_builtin then return derived[t-last_builtin].size end
+  if t >= K.Bool and t <= K.UChar then return 1 end
+  if t == K.Short or t == K.UShort then return 2 end
+  if t == K.Int or t == K.UInt or t == K.Float then return 4 end
+  if t == K.LongDouble then return 16 end
+  if t >= K.Long then return 8 end
+  return 0
+end
+
+function ct.align(t: Id): integer
+  return t > last_builtin and derived[t-last_builtin].alignment or ct.size(t)
+end
+
+function ct.promote(t: Id): Id
+  if ct.is_integer(t) and t < K.Int then return K.Int end
+  return t
+end
+
+function ct.common(a: Id, b: Id): Id
+  if a == K.Double or b == K.Double then return K.Double end
+  if a == K.Float or b == K.Float then return K.Float end
+  a, b = ct.promote(a), ct.promote(b)
+  if a == b then return a end
+  if a < b then a, b = b, a end
+  if ct.unsigned(a) or not ct.unsigned(b) or ct.size(a) > ct.size(b) then return a end
+  return a + 1 -- the unsigned type of the higher signed rank
+end
+
+function ct.pointer(t: Id): Id
+  if t == K.Unknown then return K.Unknown end
+  if not pointers:has(t) then
+    pointers[t] = register({form=Form.Pointer, element=t, size=8, alignment=8})
+  end
+  return pointers[t]
+end
+
+function ct.element(t: Id): Id
+  if not ct.is_pointer(t) and not ct.is_array(t) then return K.Unknown end
+  return derived[t-last_builtin].element
+end
+
+function ct.array(t: Id, count: integer): Id
+  if ct.size(t) == 0 or count < 0 or count > 9223372036854775807 // ct.size(t) then return K.Unknown end
+  local key = tostring(t) .. ':' .. tostring(count)
+  if not arrays:has(key) then
+    arrays[key] = register({form=Form.Array, element=t, size=count*ct.size(t), alignment=ct.align(t), count=count})
+  end
+  return arrays[key]
+end
+
+function ct.count(t: Id): integer
+  return ct.is_array(t) and derived[t-last_builtin].count or 0
+end
+
+function ct.tag(word: string, name: string): Id
+  local key = word .. ' ' .. name
+  if #name > 0 and tags:has(key) then return tags[key] end
+  local id = register({form=word == 'union' and Form.Union or Form.Record})
+  if #name > 0 then tags[key] = id end
+  return id
+end
+
+function ct.complete(t: Id, members: *ct.Members): boolean
+  if not ct.is_record(t) or #($members) == 0 then return false end
+  local size, alignment: integer = 0, 1
+  local overlap = form(t, Form.Union)
+  for i: usize = 1, #($members) do
+    local field = &($members)[i]
+    local k = field.kind
+    local a, n = ct.align(k), ct.size(k)
+    if n <= 0 or a <= 0 then return false end
+    if a > alignment then alignment = a end
+    if overlap then
+      field.offset = 0
+      if n > size then size = n end
+    else
+      size = ((size+a-1)//a)*a
+      field.offset = size
+      size = size+n
+    end
+  end
+  local item = &derived[t-last_builtin]
+  item.size = ((size+alignment-1)//alignment)*alignment
+  item.alignment = alignment
+  item.members = $members
+  return true
+end
+
+function ct.members(t: Id): *ct.Members
+  return &derived[t-last_builtin].members
+end
+
+function ct.member(t: Id,name: string): (Id,integer)
+  if not ct.is_record(t) then return K.Unknown,0 end
+  local fs=ct.members(t)
+  for i: usize=1,#($fs) do
+    local f=($fs)[i]
+    if f.name == name then return f.kind,f.offset end
+    if #f.name == 0 then
+      local k,off=ct.member(f.kind,name)
+      if k ~= K.Unknown then return k,off+f.offset end
+    end
+  end
+  return K.Unknown,0
+end
+
+-- Classify the two eightbytes of a small SysV aggregate. INTEGER takes
+-- precedence over SSE when fields of a union occupy the same eightbyte.
+local function classify(t: Id, offset: integer, parts: *[2]Id): boolean
+  if ct.is_array(t) then
+    local elem = ct.element(t)
+    for i = 0, ct.count(t)-1 do
+      if not classify(elem, offset + i*ct.size(elem), parts) then return false end
+    end
+  elseif ct.is_record(t) then
+    local members = ct.members(t)
+    for i: usize = 1, #($members) do
+      local field = ($members)[i]
+      if not classify(field.kind, offset+field.offset, parts) then return false end
+    end
+  else
+    if not ct.is_integer(t) and not ct.is_pointer(t) and not ct.floating(t) then return false end
+    local index = offset // 8
+    if index > 1 or offset % ct.align(t) ~= 0 then return false end
+    if not ct.floating(t) then ($parts)[index] = K.ULong
+    elseif ($parts)[index] == K.Unknown then ($parts)[index] = K.Double end
+  end
+  return true
+end
+
+function ct.abi_parts(t: Id, parts: *[2]Id): integer
+  local size = ct.size(t)
+  if size <= 0 or size > 16 or ct.align(t) > 8 or not classify(t, 0, parts) then return 0 end
+  return (size + 7) // 8
+end
+
+function ct.function_type(sig: ct.Signature): Id
+  local key = tostring(sig.result) .. (sig.unspecified and '?' or (sig.variadic and 'v' or 'f'))
+  for i: usize = 1, #sig.parameters do key = key .. '/' .. tostring(sig.parameters[i]) end
+  if not functions:has(key) then functions[key] = register({form=Form.Function, signature=sig}) end
+  return functions[key]
+end
+
+function ct.signature(t: Id): ct.Signature
+  return derived[t-last_builtin].signature
+end
+
+return ct

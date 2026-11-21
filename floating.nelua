@@ -1,0 +1,59 @@
+-- Floating constants use the target libc's correctly rounded C conversions.
+require 'string'
+local ct = require 'ctypes'
+local K = ct.Kind
+local fp = @record{}
+local FloatBits = @union{f: float32, bits: uint32}
+local DoubleBits = @union{d: float64, bits: uint64}
+local function strtof(s: cstring, rest: *cstring): cfloat <cimport,cinclude '<stdlib.h>'> end
+local function strtod(s: cstring, rest: *cstring): cdouble <cimport,cinclude '<stdlib.h>'> end
+
+function fp.token(word: string): boolean
+  local hex = #word>=2 and word.data[0]==48 and (word.data[1] | 32)==120
+  local exponent = hex and 112 or 101
+  for i: usize=0,<#word do
+    local c=word.data[i]
+    if c==46 or (c | 32)==exponent then return true end
+  end
+  return false
+end
+
+function fp.literal(word: string): (integer,ct.Id)
+  local last=word:sub(-1):lower()
+  local single=last == 'f'
+  if last == 'l' then return 0,K.Unknown end
+  -- The lexer borrows token text. strtod and strtof need a terminating NUL.
+  word=single and word:sub(1,-2) or string.copy(word)
+  local start=(@cstring)(word)
+  local rest: cstring
+  local n: integer
+  if single then
+    local u: FloatBits; u.f=strtof(start,&rest); n=(@integer)(u.bits)
+  else
+    local u: DoubleBits; u.d=strtod(start,&rest); n=(@integer)(u.bits)
+  end
+  local tail = (@*byte)(rest)
+  local valid = tail ~= nilptr and rest ~= start and $tail == 0
+  word:destroy()
+  if not valid then return 0,K.Unknown end
+  return n,single and K.Float or K.Double
+end
+
+-- Convert a scalar constant to the destination precision before emitting its bits.
+function fp.convert(bits: integer, from: ct.Id, into: ct.Id): integer
+  if from == into then return bits end
+  local f: FloatBits
+  local d: DoubleBits
+  if into == K.Float then
+    if from == K.Double then d.bits = (@uint64)(bits); f.f = (@float32)(d.d)
+    elseif ct.unsigned(from) then f.f = (@float32)((@uint64)(bits))
+    else f.f = (@float32)(bits) end
+    return (@integer)(f.bits)
+  end
+  if from == K.Float then f.bits = (@uint32)(bits); d.d = f.f
+  elseif ct.unsigned(from) then d.d = (@float64)((@uint64)(bits))
+  else d.d = (@float64)(bits) end
+  return (@integer)(d.bits)
+end
+
+return fp

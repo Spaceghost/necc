@@ -1,0 +1,62 @@
+-- Promote isolated 64-bit frame slots in leaf functions to unused
+-- caller-saved registers. An observable frame address or a partial-width
+-- access leaves the original frame in place.
+require 'sequence'
+require 'string'
+local leaf = @record{}
+local registers: []string = {'%r8','%r9','%r10','%r11'}
+local Edit = @record{row: usize, slot: usize, first: isize, last: isize}
+
+function leaf.promote(code: *sequence(string), size: integer): boolean
+  if size<=0 or size>32 or size%8~=0 then return false end
+  local count=(@usize)(size//8)
+  local busy: [4]boolean
+  local edits: sequence(Edit)
+  defer edits:destroy() end
+  for i: usize=1,#($code) do
+    local line=($code)[i]
+    if line:subview(1,6)=='  call' then return false end
+    local bp: isize=0
+    for k: integer=0,<(@integer)(#line)-2 do
+      if line.data[k]~=37 or line.data[k+1]~=114 then continue end
+      local c=line.data[k+2]
+      if c=='8'_b then busy[0]=true
+      elseif c=='9'_b then busy[1]=true
+      elseif k+3<(#line) then
+        local d=line.data[k+3]
+        if c=='1'_b and d=='0'_b then busy[2]=true elseif c=='1'_b and d=='1'_b then busy[3]=true
+        elseif c=='s'_b and d=='p'_b then return false
+        elseif c=='b'_b and d=='p'_b then
+          if bp~=0 then return false end
+          bp=(@isize)(k+1)
+        end
+      end
+    end
+    if bp==0 then continue end
+    local op=line:subview(3,6)
+    if op~='movq' and op~='addq' and op~='subq' and op~='andq' and op~='xorq' and
+        op~='cmpq' and line:subview(3,5)~='orq' and line:subview(3,7)~='imulq' then return false end
+    if bp<4 or bp+4>(@isize)(#line) or line:byte(bp-1)~=40 or line:byte(bp+4)~=41 then return false end
+    local first=bp-2
+    while first>1 and line:byte(first)>=48 and line:byte(first)<=57 do first=first-1 end
+    if first<2 or line:byte(first)~=45 or line:byte(first-1)~=32 then return false end
+    local offset: usize=0
+    for k=first+1,bp-2 do offset=10*offset+(line:byte(k)-48) end
+    if offset==0 or offset>(@usize)(size) or offset%8~=0 then return false end
+    edits:push({row=i,slot=offset//8-1,first=first,last=bp+4})
+  end
+  local selected: [4]string
+  local available: usize=0
+  for i: usize=0,<4 do
+    if not busy[i] then selected[available]=registers[i]; available=available+1 end
+  end
+  if available<count then return false end
+  for i: usize=1,#edits do
+    local e=edits[i]
+    local dest=&($code)[e.row]
+    local line=$dest
+    $dest=line:subview(1,e.first-1) .. selected[e.slot] .. line:subview(e.last+1)
+  end
+  return true
+end
+return leaf

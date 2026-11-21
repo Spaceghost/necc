@@ -1,0 +1,79 @@
+-- Single-threaded frontend allocations. Reuse small blocks by size class,
+-- and delegate large buffers to libc. Each compiler process handles one unit.
+local function malloc(n: csize): pointer <cimport,cinclude '<stdlib.h>'> end
+local function free(p: pointer): void <cimport,cinclude '<stdlib.h>'> end
+local function resize(p: pointer,n: csize): pointer <cimport 'realloc',cinclude '<stdlib.h>'> end
+local function zero(p: pointer,b: cint,n: csize): pointer <cimport 'memset',cinclude '<string.h>'> end
+local function copy(dst: pointer,src: pointer,n: csize): pointer <cimport 'memcpy',cinclude '<string.h>'> end
+
+local Header = @record{bin: usize, next: pointer}
+local Bucket = @record{free_head: *Header, cursor: *[0]byte, left: usize}
+local Pool = @record{bins: [7]Bucket}
+global embedded_general_allocator: Pool
+local slab_bytes: usize <comptime> = 16384
+
+local function size_class(n: usize): usize
+  if n<=16 then return 0 elseif n<=32 then return 1 elseif n<=64 then return 2
+  elseif n<=128 then return 3 elseif n<=256 then return 4 elseif n<=512 then return 5
+  elseif n<=1024 then return 6 end
+  return 7
+end
+
+function Pool:alloc(n: usize): pointer
+  if n==0 or n>~(@usize)(0)-#Header then return nilptr end
+  local index=size_class(n)
+  local h: *Header
+  if index==7 then
+    h=(@*Header)(malloc(n+#Header))
+    if h==nilptr then return nilptr end
+  else
+    local b=&self.bins[index]
+    if b.free_head~=nilptr then
+      h=b.free_head; b.free_head=(@*Header)(h.next)
+    else
+      local stride=((@usize)(16)<<index)+#Header
+      if b.left<stride then
+        b.cursor=(@*[0]byte)(malloc(slab_bytes))
+        if b.cursor==nilptr then b.left=0; return nilptr end
+        b.left=slab_bytes
+      end
+      h=(@*Header)(b.cursor)
+      b.cursor=(@*[0]byte)((@usize)(b.cursor)+stride); b.left=b.left-stride
+    end
+  end
+  h.bin=index
+  return (@pointer)((@usize)(h)+#Header)
+end
+
+function Pool:alloc0(n: usize): pointer
+  local p=self:alloc(n)
+  if p~=nilptr then zero(p,0,n) end
+  return p
+end
+
+function Pool:dealloc(p: pointer)
+  if p==nilptr then return end
+  local h=(@*Header)((@usize)(p)-#Header)
+  if h.bin==7 then free(h); return end
+  local b=&self.bins[h.bin]
+  h.next=b.free_head; b.free_head=h
+end
+
+function Pool:realloc(p: pointer,n: usize,oldsize: usize): pointer
+  if n==0 then self:dealloc(p); return nilptr end
+  if p==nilptr then return self:alloc(n) end
+  if n>~(@usize)(0)-#Header then return nilptr end
+  local h=(@*Header)((@usize)(p)-#Header)
+  if h.bin==7 and n>1024 then
+    local result=resize(h,n+#Header)
+    if result==nilptr then return nilptr end
+    return (@pointer)((@usize)(result)+#Header)
+  end
+  if h.bin<7 and n<=((@usize)(16)<<h.bin) then return p end
+  local result=self:alloc(n)
+  if result~=nilptr then
+    copy(result,p,oldsize<n and oldsize or n)
+    self:dealloc(p)
+  end
+  return result
+end
