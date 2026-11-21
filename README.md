@@ -100,7 +100,10 @@ assertions check layouts emitted by the full Nelua frontend. Integer constant
 expressions use LP64 types and support typedef casts,
 `sizeof`, `_Alignof` and `offsetof`. Floating expressions and calls use the
 scalar SSE ABI for `float` and `double`. Fixed and variadic functions can
-exchange values across both register classes and the stack.
+exchange values across both register classes and the stack. GNU `weak`
+declarations support replaceable functions and objects, including optional
+external hooks. File-scope `__asm__("...")` accepts the adjacent string
+literals used to define Nelibc's weak allocator aliases.
 
 The SDK tests call across GCC and necc in both directions, including mixed
 variadic functions, stack arguments, record layout and floating-point values.
@@ -194,11 +197,12 @@ identical archives.
 To build more of Nelibc with necc, pass the nelinker and necc source
 directories after the output prefix. From an empty build directory, the
 graph below builds both tools against the seed SDK. The staged necc
-generates code for 26 of the 47 objects, including memory and string
+generates code for 28 of the 47 objects, including memory and string
 operations, character classification and conversion, account lookup,
 search, unistd, POSIX message queues and System V IPC. Twenty of these
-objects come from Nelua modules and six from C adapters. TinyCC compiles
-ten other objects and GCC supplies eleven.
+objects come from Nelua modules and eight from C adapters, including the
+weak stdio hooks and replaceable allocator exports. TinyCC compiles
+eight other objects and GCC supplies eleven.
 The staged nelinker writes the indexed archive and links the Lua runtime.
 The seed SDK must be on an absolute path. Relative tool and output names
 are relative to the build directory.

@@ -1454,6 +1454,21 @@ local function object_start(v: Variable,out: *sequence(string))
   out:push('.type ' .. v.symbol .. ', @object'); out:push(v.symbol .. ':')
 end
 
+-- Apply weak binding after all definitions, including attributes on redeclarations.
+local weak_symbols: sequence(string)
+local weak_instructions: hashmap(string,string)
+local function weak_binding(d: headers.Declaration, internal: boolean)
+  if d.weak then
+    if internal then fail('weak symbol must have external linkage: ' .. d.name) end
+    local call = '  call ' .. d.name
+    if weak_instructions:has(call) then return end
+    local pointer = '.Lnecc_weak_' .. d.name .. '(%rip)'
+    weak_instructions[call] = '  call *' .. pointer
+    weak_instructions['  leaq ' .. d.name .. '(%rip), %rax'] = '  movq ' .. pointer .. ', %rax'
+    weak_symbols:push(d.name)
+  end
+end
+
 local tentative: sequence(string)
 local function global_object(d: headers.Declaration, init: boolean, from_header: boolean)
   local name=d.name
@@ -1468,6 +1483,7 @@ local function global_object(d: headers.Declaration, init: boolean, from_header:
     v={kind=d.kind,symbol=d.internal and '.Lnecc_global_' .. name or name,internal=d.internal,
        readonly=d.readonly and not ct.is_pointer(d.kind)}
   end
+  weak_binding(d,v.internal)
   variables[name]=v
   if init then
     if v.defined then fail('duplicate global ' .. name) end
@@ -1532,6 +1548,7 @@ end
 local function register_fn(d: headers.Declaration, definition: boolean): ct.Signature
   if variables:has(d.name) or aliases:has(d.name) or enumerators:has(d.name) then fail('duplicate global ' .. d.name) end
   local sig=ct.signature(d.kind); sig.internal=d.internal
+  weak_binding(d,d.internal or (functions:has(d.name) and functions[d.name].internal))
   if functions:has(d.name) then
     local prev=functions[d.name]
     if (not prev.unspecified and not sig.unspecified and ct.function_type(prev) ~= d.kind) or
@@ -1789,6 +1806,7 @@ local function compile_function(d: headers.Declaration)
   elseif sig.result ~= Kind.Void then emit('ud2') end
   emit(ret .. ':')
   if depth ~= 0 then fail('unbalanced expression stack') end
+  assembly:push('.text')
   if not sig.internal then assembly:push('.globl ' .. d.name) end
   assembly:push('.type ' .. d.name .. ', @function'); assembly:push(d.name .. ':')
   -- RDI/RSI and the full XMM6-XMM15 are nonvolatile for an MS caller.
@@ -1851,6 +1869,9 @@ function decl_group(top: boolean)
     end
     if not allowed_name(d.name) then fail('invalid declarator name ' .. d.name) end
     if #prefix == 0 then for i: usize=1,d.spec_count do prefix:push(words[i]) end end
+    if d.weak and not top and not (d.external or ct.is_function(d.kind)) then
+      fail('weak symbol must have external linkage: ' .. d.name)
+    end
     if d.is_typedef then save_typedef(d)
     elseif ct.is_function(d.kind) then
       if top and take('{') then compile_function(d); return end
@@ -1870,6 +1891,7 @@ function decl_group(top: boolean)
         out:push('.size ' .. v.symbol .. ', .-' .. v.symbol)
         bind_local(d.name,v)
       elseif d.external then
+        if d.weak then global_object(d,false,true) end
         local v: Variable={kind=d.kind,symbol=d.name,readonly=readonly}
         if variables:has(d.name) then
           v=variables[d.name]
@@ -1921,7 +1943,18 @@ local function compile_unit(path: string, destination: string, roots: *sequence(
   assembly:push('.text')
   next_token()
   while token ~= '' do
-    if inside_header then header_declaration() else decl_group(true) end
+    if inside_header then header_declaration()
+    elseif take('__asm__') or take('__asm') then
+      expect('(')
+      if #token == 0 or token:byte(1) ~= 34 then fail('expected a file-scope assembly string') end
+      local bytes = strings()
+      expect(')'); expect(';')
+      local size = #bytes-1
+      if memory.scan(&bytes[1],0,size) ~= nilptr then fail('NUL byte in file-scope assembly') end
+      -- Keep user assembly distinct from compiler-generated instructions.
+      assembly:push('\n' .. (@string){data=&bytes[1],size=size})
+      bytes:destroy()
+    else decl_group(true) end
   end
   for i: usize=1,#tentative do
     local v=variables[tentative[i]]
@@ -1940,6 +1973,21 @@ local function compile_unit(path: string, destination: string, roots: *sequence(
     assembly:push('.section .rodata')
     for i: usize = 1, #rodata do assembly:push(rodata[i]) end
     for i: usize = 1, #constants do assembly:push(constants[i]) end
+  end
+  if #weak_symbols > 0 then
+    -- The seed assembler resolves same-section direct calls locally, even
+    -- for weak definitions. Its linker also needs an absolute relocation
+    -- to resolve the address of an absent weak symbol to zero.
+    for i: usize = 1, #assembly do
+      local found,replacement = weak_instructions:has_and_get(assembly[i])
+      if found then assembly[i] = replacement end
+    end
+    assembly:push('.section .rodata'); assembly:push('.balign 8')
+    for i: usize = 1, #weak_symbols do
+      local name = weak_symbols[i]
+      assembly:push('.weak ' .. name)
+      assembly:push('.Lnecc_weak_' .. name .. ':'); assembly:push('  .quad ' .. name)
+    end
   end
   assembly:push('.section .note.GNU-stack,"",@progbits')
 

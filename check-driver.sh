@@ -112,9 +112,50 @@ reject_attribute() {
     fi
     test ! -e "$name.o"
 }
-reject_attribute weak 'int __attribute__((weak)) weakfn(void);'
+cat > weak.c <<'C'
+int __attribute__((__pure__, __weak__)) hook(void);
+int hook(void) { return 5; }
+int value __attribute__((weak)) = 7;
+int tentative __attribute__((weak));
+int late(void) { return 3; }
+extern int late(void) __attribute__((weak));
+int alias(void);
+__asm__(".weak " "alias" "\n.set alias, hook");
+int call_hook(void) { return hook() + value + tentative; }
+C
+"$necc" -c weak.c -o weak.o
+for symbol in hook value tentative late alias; do
+    readelf -Ws weak.o | awk -v symbol="$symbol" '$5=="WEAK" && $(NF-1)!="UND" && $NF==symbol {found=1} END {exit !found}'
+done
+cat > weak-main.c <<'C'
+int alias(void), call_hook(void);
+int main(void) { return alias() == 5 && call_hook() == 12 ? 0 : 1; }
+C
+"$necc" weak-main.c weak.o -o weak-default
+./weak-default
+cat > override.c <<'C'
+int hook(void) { return 20; }
+int value = 21;
+int tentative = 1;
+int call_hook(void);
+int main(void) { return call_hook() == 42 ? 0 : 1; }
+C
+"$necc" -c override.c -o override.o
+"$necc" weak.o override.o -o weak-first
+./weak-first
+"$necc" override.o weak.o -o strong-first
+./strong-first
+cat > optional.c <<'C'
+extern int optional(void) __attribute__((weak));
+int main(void) { return optional ? optional() : 42; }
+C
+"$necc" optional.c -o optional
+check_link ./optional
+reject_attribute private_weak 'static int __attribute__((weak)) private_hook(void);'
+reject_attribute local_weak 'int f(void) { int value __attribute__((weak)); return 0; }'
+reject_attribute parameter_weak 'int f(int value __attribute__((weak)));'
 reject_attribute aligned 'int __attribute__((aligned(16))) aligned_object;'
-reject_attribute pure_weak 'int __attribute__((__pure__, weak)) mixed(int);'
+reject_attribute weak_aligned 'int __attribute__((weak, aligned(32))) mixed;'
 echo 'Multi-file native C, ordered static archives, GNU pure/const attributes, mixed Nelua/C, and atomic failed links passed'
 cat > bytes.c <<'C'
 const unsigned char table[3 + 2] = {0x41, 0377, 0x80};

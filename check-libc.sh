@@ -25,11 +25,11 @@ export NECC_SYSROOT="$work/sdk" TMPDIR="$work" TMP="$work" TEMP="$work"
 builtin=$("$gcc" -print-file-name=include)
 compile() {
     "$gcc" -m64 -O2 -fno-pie -fno-stack-protector -ffreestanding -fno-builtin -ftls-model=local-exec \
-        -nostdinc -DNELIBC_STANDALONE -I"$tree/include" -isystem "$builtin" -isystem "$sdk/uapi" -c "$1" -o "$2"
+        -nostdinc -DNELIBC_STANDALONE -I"$tree/include" -isystem "$builtin" -isystem "$sdk/uapi" -c "$@"
 }
 check_source() {
     name=$1 source=$2; shift 2
-    compile "$source" "$name.o"
+    compile "$source" -o "$name.o"
     "$cc" "$name.o" "$@" -o "$name"
     readelf -lW "$name" > "$name.segments"
     readelf -dW "$name" > "$name.dynamic"
@@ -55,10 +55,19 @@ cmp exit_atexit_smoke.expected exit_atexit_smoke.actual
     -Wl,--whole-archive "$archive" -Wl,--no-whole-archive "$sdk/tcc/libtcc1.a" -o gnu-consumer
 timeout 90 ./gnu-consumer
 echo 'lib_consumer_smoke passed with GNU ld'
+# Static applications may replace malloc alone or supply aligned_alloc too.
+# Compile the existing standalone consumer with both policies.
+for replacement in ordinary aligned; do
+    set --
+    if [ "$replacement" = aligned ]; then set -- -DREPLACE_ALIGNED; fi
+    compile "$tree/tools/malloc_replace_smoke.c" "$@" -o replace.o
+    "$cc" replace.o -o replace
+    timeout 90 ./replace
+done
 check errno_tls_smoke
 check math_core_standalone_smoke
 check complex_math_smoke
 "$cc" --release --emit-c "$tree/tools/tls_fixture.nelua" -o tls_fixture.c
-compile tls_fixture.c tls_fixture.o
-compile "$tree/tools/tls_alignment_fixture.c" tls_alignment_fixture.o
+compile tls_fixture.c -o tls_fixture.o
+compile "$tree/tools/tls_alignment_fixture.c" -o tls_alignment_fixture.o
 check pthread_standalone_smoke tls_fixture.o tls_alignment_fixture.o
