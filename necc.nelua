@@ -1177,6 +1177,59 @@ local function space(out: *sequence(string), n: integer)
   if n > 0 then out:push('  .space ' .. tostring(n)) end
 end
 
+local function address_initializer(words: *headers.Tokens, first: usize, last: usize): (string, integer, Id)
+  local address = first <= last and ($words)[first] == '&'
+  local at = address and first + 1 or first
+  if at > last then return '', 0, Kind.Unknown end
+  local name = ($words)[at]
+  if not variables:has(name) then return '', 0, Kind.Unknown end
+  local variable = variables[name]
+  local kind, addend: Id, integer = variable.kind, 0
+  local one_past = false
+  at = at + 1
+  while at <= last do
+    local token = ($words)[at]
+    if token == '.' then
+      if one_past or at == last or not ct.is_record(kind) then return '', 0, Kind.Unknown end
+      local member_kind, member_offset = ct.member(kind, ($words)[at + 1])
+      if member_kind == Kind.Unknown then return '', 0, Kind.Unknown end
+      if member_offset > 9223372036854775807 - addend then fail('address initializer offset overflow') end
+      addend = addend + member_offset
+      kind = member_kind
+      at = at + 2
+    elseif token == '[' then
+      local close = at + 1
+      local nesting = 1
+      while close <= last and nesting > 0 do
+        if ($words)[close] == '[' then nesting = nesting + 1
+        elseif ($words)[close] == ']' then nesting = nesting - 1 end
+        if nesting > 0 then close = close + 1 end
+      end
+      if nesting ~= 0 or not ct.is_array(kind) then return '', 0, Kind.Unknown end
+      local index_tokens: ce.Tokens
+      for i = at + 1, close - 1 do index_tokens:push(($words)[i]) end
+      local index, ok = ce.evaluate(&index_tokens, &enumerators, &aliases)
+      index_tokens:destroy()
+      local count, element = ct.count(kind), ct.element(kind)
+      if not ok or index < 0 or ct.size(element) == 0 or (count > 0 and index > count) then
+        return '', 0, Kind.Unknown
+      end
+      local element_size = ct.size(element)
+      if index > (9223372036854775807 - addend) // element_size then fail('address initializer offset overflow') end
+      addend = addend + index * element_size
+      kind = element
+      at = close + 1
+      if count > 0 and index == count then one_past = true end
+      if one_past and at <= last then return '', 0, Kind.Unknown end
+    else
+      return '', 0, Kind.Unknown
+    end
+  end
+  if not address and (not ct.is_array(kind) or one_past) then return '', 0, Kind.Unknown end
+  if not address then kind = ct.element(kind) end
+  return variable.symbol, addend, ct.pointer(kind)
+end
+
 local function pointer_constant(words: *headers.Tokens, first: usize, last: usize, k: Id): string
   if first > last then fail('expected pointer initializer') end
   if ($words)[first] == '(' then
@@ -1210,6 +1263,11 @@ local function pointer_constant(words: *headers.Tokens, first: usize, last: usiz
     local name = string_symbol(&bytes); bytes:destroy()
     return name
   end
+  local name, addend, address_type = address_initializer(words, first, last)
+  if address_type ~= Kind.Unknown then
+    if not compatible_pointer(address_type,k) then fail('incompatible address initializer') end
+    return addend == 0 and name or name .. '+' .. tostring(addend)
+  end
   local addr=($words)[first] == '&'
   local at=addr and first+1 or first
   if at == last then
@@ -1217,11 +1275,6 @@ local function pointer_constant(words: *headers.Tokens, first: usize, last: usiz
     if functions:has(name) then
       if not compatible_pointer(ct.pointer(ct.function_type(functions[name])),k) then fail('incompatible function pointer') end
       return name
-    elseif variables:has(name) then
-      local v=variables[name]
-      local t=addr and ct.pointer(v.kind) or (ct.is_array(v.kind) and ct.pointer(ct.element(v.kind)) or Kind.Unknown)
-      if t == Kind.Unknown or not compatible_pointer(t,k) then fail('incompatible address initializer') end
-      return v.symbol
     end
   end
   local expr: ce.Tokens

@@ -64,6 +64,62 @@ test "$expected" -eq 35
 test "$actual" -eq "$expected"
 test -z "$(nm -u "$out/abi")"
 
+cat > "$out/static-address.c" <<'C'
+struct Leaf { int values[3]; char tail; };
+struct Node { char tag; struct Leaf leaves[2]; int end; };
+static struct Node node = {
+    17,
+    {{{0, 0, 0}, 0}, {{23, 0, 42}, 0}},
+    61
+};
+static int *nested_address = &node.leaves[1].values[2];
+static char *field_address = &node.tag;
+static int *decayed_array = node.leaves[1].values;
+static int *one_past = &node.leaves[1].values[3];
+static void *cast_address = (void *)(&node.end);
+static void *null_address = (void *)0;
+int main(void) {
+    return *nested_address != 42
+        || *field_address != 17
+        || *decayed_array != 23
+        || one_past != &node.leaves[1].values[3]
+        || cast_address != &node.end
+        || null_address != 0;
+}
+C
+"$necc" "$out/static-address.c" -o "$out/static-address.s"
+"$as" --64 "$out/static-address.s" -o "$out/static-address.o"
+"$ld" -m elf_x86_64 -static -e _start "$out/static-address.o" \
+    --whole-archive "$archive" --no-whole-archive "$@" -o "$out/static-address"
+"$cc" -std=c11 -Wall -Wextra -Werror "$out/static-address.c" -o "$out/static-address-reference"
+"$out/static-address-reference"
+"$out/static-address"
+
+cat > "$out/static-address-extern.c" <<'C'
+extern int external_values[];
+int *external_second = &external_values[2];
+C
+"$necc" "$out/static-address-extern.c" -o "$out/static-address-extern.s"
+"$as" --64 "$out/static-address-extern.s" -o "$out/static-address-extern.o"
+readelf -rW "$out/static-address-extern.o" | grep -E 'external_values \+ 8$' >/dev/null
+"$cc" -std=c11 -Wall -Wextra -Werror -c "$out/static-address-extern.c" -o "$out/static-address-extern-reference.o"
+readelf -rW "$out/static-address-extern-reference.o" | grep -E 'external_values \+ 8$' >/dev/null
+
+reject_static_address() {
+    name=$1
+    source=$2
+    printf '%s\n' "$source" > "$out/$name.c"
+    if "$necc" "$out/$name.c" -o "$out/$name.s" 2> "$out/$name.error"; then
+        echo "expected $name to be rejected" >&2
+        exit 1
+    fi
+}
+reject_static_address invalid-member 'struct Value { int member; }; static struct Value value; static int *invalid = &value.missing;'
+reject_static_address invalid-bound 'struct Value { int members[2]; }; static struct Value value; static int *invalid = &value.members[3];'
+reject_static_address invalid-index 'struct Value { int members[2]; }; static struct Value value; extern int index; static int *invalid = &value.members[index];'
+reject_static_address invalid-type 'struct Value { int members[2]; }; static struct Value value; static char *invalid = &value.members[0];'
+reject_static_address invalid-one-past-decay 'struct Value { int matrix[2][3]; }; static struct Value value; static int *invalid = value.matrix[2];'
+
 cat > "$out/aggregate-zero.c" <<'C'
 struct Inner { int value; void *pointer; };
 struct Outer { struct Inner items[2]; int tail; };
