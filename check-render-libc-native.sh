@@ -59,7 +59,7 @@ render legacy5 libc
 render legacy6 libc "$nelinker_src"
 for graph in legacy4 legacy5 legacy6; do
     for name in $native_objects; do
-        case "$name" in slocale|exit|extras|sys-linux|sysops|fcntl|semaphore|syscall) continue;; esac
+        case "$name" in slocale|exit|extras|sys-linux|sysops|fcntl|semaphore|syscall|credentials|stdio-lock) continue;; esac
         if [ "$graph" = legacy4 ]; then target=$name.o; else target=libc/$name.o; fi
         line=$(recipe "$target" "$out/$graph/build.ne")
         case "$line" in *"$sdk/tcc/tcc"*) ;; *) echo "$graph unexpectedly selected native necc for $name" >&2; exit 1;; esac

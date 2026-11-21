@@ -318,7 +318,9 @@ function driver.run(frontend: function(string,string,*Args)): void <noreturn>
     end
   end
   if mode ~= '--emit-c' then
-    local flags: Args = {'-B' .. sdk .. '/tcc', '-nostdinc', '-std=c11', '-DNELIBC_STANDALONE'}
+    local flags: Args = {'-B' .. sdk .. '/tcc', '-nostdinc', '-std=c11', '-DNELIBC_STANDALONE',
+      '-D__ATOMIC_RELAXED=0', '-D__ATOMIC_CONSUME=1', '-D__ATOMIC_ACQUIRE=2',
+      '-D__ATOMIC_RELEASE=3', '-D__ATOMIC_ACQ_REL=4', '-D__ATOMIC_SEQ_CST=5'}
     for k: usize = 1, #options do flags:push(options[k]) end
     for k: usize = 1, #system_dirs do
       flags:push('-isystem')

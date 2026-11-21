@@ -177,22 +177,31 @@ export NECC_SYSROOT="$SDK"
 "$NECC_SRC/check-libc.sh" "$NECC" "$SDK" "$NELIBC_SRC" "$(command -v gcc)" "$PWD/libnelibc.a" "$SCRATCH"
 ```
 
-The graph builds all 47 archive members from source. The native necc backend
-compiles the syscall table, fcntl, semaphore and syscall adapters, plus the
-exit, standalone extras, string locale and Linux syscall modules. TinyCC
-preprocesses and assembles those eight objects and compiles 28 others.
-An x86-64 Linux GCC supplies the remaining eleven object files for
-local-exec TLS, atomic operations, the complex calling convention, and
-assembly. For the two Nelua modules with thread-local storage, necc emits C
-and GCC compiles it. The build uses Nelibc's headers, the staged Linux
-headers, and compiler builtin headers. The generated archive can be used as
-the Nelibc archive argument to `stage-sdk.sh`.
+The seven-argument graph builds all 47 archive members from source. Native
+necc compiles 35: 24 Nelua modules and 11 C adapters, including credential
+synchronization and stdio locks. TinyCC handles three C sources that use inline
+assembly or variable-length arrays. GCC supplies the remaining nine objects,
+including local-exec TLS and the complex calling convention. For the two Nelua
+modules with thread-local storage, necc emits C and GCC compiles it. The build
+uses Nelibc's headers, the staged Linux headers, and compiler builtin headers.
+The generated archive can be used as the Nelibc archive argument to
+`stage-sdk.sh`.
 
 The check links against the new archive and runs Nelibc's general library
-consumer, two-thread errno check, real and complex math checks, and pthread
-suite with the TLS alignment fixtures. It also links and runs the general
+consumer, two-thread errno check, cross-thread stdio lock and credential
+checks, real and complex math checks, and pthread suite with the TLS alignment
+fixtures. It also links and runs the general
 consumer with GNU ld to check the archive with both linkers. GNU readelf
 inspects the static executables.
+
+
+The native C backend lowers GCC-compatible `__atomic_load_n`, `__atomic_store_n`,
+`__atomic_exchange_n`, integer fetch/add/sub and compare-exchange builtins for
+1-, 2-, 4- and 8-byte integer values. It uses x86-64 locked instructions,
+which provide stronger ordering than requested. Memory-order and weak-flag
+arguments must have integer type; atomic `_Bool` operands and pointer arithmetic
+are diagnosed as unsupported. Pointer-valued load/store/exchange/compare-
+exchange are supported when their types are compatible.
 
 The generated C files have stable names so object metadata is reproducible.
 Each archive member fits the staged archiver's 15-byte name limit. Two clean
@@ -206,11 +215,13 @@ compiles both the linker and the final compiler. The new linker links the
 final compiler. Recompiling the compiler with that pair produces an
 identical executable.
 
-The native compiler generates code for 33 of the 47 objects. Twenty-four
-come from Nelua modules and nine from C adapters. This includes locale,
-stdio, the variadic stdio adapter, math core and string-to-floating-point
-conversion. TinyCC compiles the memory helper, exec and stdio extras.
-GCC and its assembler supply eleven.
+The legacy graph keeps the seed compiler's eight-object native profile.
+TinyCC compiles 28 objects and GCC plus its assembler supply eleven.
+The staged graph generates native code for 35 of 47 objects: 24 Nelua modules
+and 11 C adapters. TinyCC handles three C sources that use inline assembly or
+variable-length arrays; GCC and its assembler supply the remaining nine.
+This includes locale, stdio, stdio locking, credential synchronization,
+math core and string-to-floating-point conversion.
 The staged nelinker writes the indexed archive and links the Lua runtime.
 The seed SDK must be on an absolute path. Relative tool and output names
 are relative to the build directory.

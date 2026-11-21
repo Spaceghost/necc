@@ -47,6 +47,7 @@ check() {
 check lib_consumer_smoke
 check_source libc_native_data "$script_dir/tests/libc_native_data.c"
 check_source libc_native_float "$script_dir/tests/libc_native_float.c"
+check_source libc_native_threads "$script_dir/tests/libc_native_threads.c"
 "$cc" -DNELIBC_STANDALONE "$script_dir/tests/libc_native_float.c" -o native-float
 ./native-float
 printf 'shutdown\nexit_atexit_smoke passed\n' > exit_atexit_smoke.expected
