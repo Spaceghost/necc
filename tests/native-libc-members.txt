@@ -10,6 +10,7 @@ iconv
 inet
 ipc
 locale
+math-core
 memory
 mqueue
 pwd

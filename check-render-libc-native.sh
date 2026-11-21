@@ -51,7 +51,7 @@ recipe() {
 native_objects=$(cat "$script_dir/tests/native-libc-members.txt")
 set -- $native_objects
 native_count=$#
-stage_rebuild_count=$((native_count + 2))
+stage_rebuild_count=$((native_count + 4))
 
 # The 4-, 5-, and 6-argument graphs keep the seed compiler's original coverage.
 render legacy4
@@ -70,10 +70,14 @@ done
 # Verify source mode and its exact compiler recipe, including an empty prefix.
 render native libc "$nelinker_src" "$necc_src"
 graph=$out/native/build.ne
+bootstrap=$(recipe libc/necc-bootstrap "$graph")
+case "$bootstrap" in *"'$seed' '--release'"*"'$necc_src/necc.nelua'"*) ;; *) echo 'wrong seed bootstrap command' >&2; exit 1;; esac
+linker=$(recipe libc/nelinker "$graph")
+case "$linker" in *"'libc/necc-bootstrap' '--native' '--release'"*"'$nelinker_src/src/nelinker.nelua'"*) ;; *)
+    echo 'the bootstrap compiler must generate the linker' >&2; exit 1;; esac
 stage=$(recipe libc/necc "$graph")
-case "$stage" in *"'--release'"*"'$necc_src/necc.nelua'"*"'-o' 'libc/necc'"*) ;; *)
-    echo 'native graph has the wrong stage compiler recipe' >&2; exit 1;; esac
-case "$stage" in *"'--native'"*) echo 'stage bootstrap must use the released full Nelua frontend' >&2; exit 1;; esac
+case "$stage" in *"NECC_NELINKER='libc/nelinker'"*"'libc/necc-bootstrap' '--native' '--release'"*"'$necc_src/necc.nelua'"*) ;; *)
+    echo 'wrong native compiler build' >&2; exit 1;; esac
 for name in $native_objects; do
     line=$(recipe "libc/$name.o" "$graph")
     case "$line" in *"'libc/necc' '-c'"*) ;; *) echo "native graph did not select libc/necc for $name" >&2; exit 1;; esac
@@ -94,9 +98,13 @@ cd "$out/native"
 "$nebuild" -j 2 build.ne libc/libnelibc.a > first-build.log 2>&1
 test -x libc/necc
 test -x libc/nelinker
+# Compile the compiler once more with its native-built executable and linker.
+# Identical output verifies that the bootstrap and rebuilt stages agree.
+NECC_NELINKER="$PWD/libc/nelinker" libc/necc --native --release -L "$necc_src" "$necc_src/necc.nelua" -o next-necc
+cmp libc/necc next-necc
 for name in $native_objects; do test -s "libc/$name.o"; done
 test "$(grep -Fc "'libc/necc' '-c'" first-build.log)" -eq "$native_count"
-"$script_dir/check-libc.sh" "$out/native/libc/necc" "$sdk" "$nelibc" \
+NECC_NELINKER="$out/native/libc/nelinker" "$script_dir/check-libc.sh" "$out/native/libc/necc" "$sdk" "$nelibc" \
     "$gcc" "$out/native/libc/libnelibc.a" "$out/checks"
 "$nebuild" -j 2 build.ne libc/libnelibc.a > warm-build.log 2>&1
 test ! -s warm-build.log
@@ -111,13 +119,13 @@ cp "$necc_src"/*.nelua "$out/compiler-source/"
 "$nebuild" -j 2 "$out/native/build.ne" libc/libnelibc.a > copy-source-build.log 2>&1
 test "$(wc -l < copy-source-build.log)" -eq "$stage_rebuild_count"
 test "$(grep -Fc "'libc/necc' '-c'" copy-source-build.log)" -eq "$native_count"
-test "$(grep -Fc "'--release'" copy-source-build.log)" -eq 1
+test "$(grep -Fc "'--release'" copy-source-build.log)" -eq 3
 test "$(grep -Fc "'libc/nelinker' '--archive'" copy-source-build.log)" -eq 1
 printf '\n-- source dependency regression comment\n' >> "$out/compiler-source/leaf.nelua"
 "$nebuild" -j 2 "$out/native/build.ne" libc/libnelibc.a > changed-source-build.log 2>&1
 test "$(wc -l < changed-source-build.log)" -eq "$stage_rebuild_count"
 test "$(grep -Fc "'libc/necc' '-c'" changed-source-build.log)" -eq "$native_count"
-test "$(grep -Fc "'--release'" changed-source-build.log)" -eq 1
+test "$(grep -Fc "'--release'" changed-source-build.log)" -eq 3
 test "$(grep -Fc "'libc/nelinker' '--archive'" changed-source-build.log)" -eq 1
 "$nebuild" -j 2 "$out/native/build.ne" libc/libnelibc.a > final-warm-build.log 2>&1
 test ! -s final-warm-build.log

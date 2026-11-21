@@ -109,8 +109,8 @@ The SDK tests call across GCC and necc in both directions, including mixed
 variadic functions, stack arguments, record layout and floating-point values.
 Small structures and unions with integer or SSE fields can be passed and returned
 by value, including their stack fallback when registers run out. Larger
-records made of integer, pointer and SSE fields with alignment up to eight
-bytes pass on the stack. The caller supplies storage for their return
+records with integer, SSE or x87 fields and up to 16-byte alignment pass
+on the stack. The caller supplies storage for their return
 values. GNU empty records occupy zero bytes and consume no SysV argument
 register. Scalar `long double` uses the x87 80-bit format, 16-byte stack
 slots and the x87 return register. The arithmetic, casts and variadic calls
@@ -199,12 +199,16 @@ identical archives.
 
 To build more of Nelibc with necc, pass the nelinker and necc source
 directories after the output prefix. From an empty build directory, the
-graph below builds both tools against the seed SDK. The staged necc
-generates code for 32 of the 47 objects. Twenty-three come from Nelua
-modules and nine from C adapters. This includes locale, stdio, the variadic
-stdio adapter, and string-to-floating-point conversion. TinyCC compiles
-the memory helper, math core, exec and stdio extras objects. GCC and its
-assembler supply eleven.
+graph below bootstraps a compiler with the seed SDK. Its native backend
+compiles both the linker and the final compiler. The new linker links the
+final compiler. Recompiling the compiler with that pair produces an
+identical executable.
+
+The native compiler generates code for 33 of the 47 objects. Twenty-four
+come from Nelua modules and nine from C adapters. This includes locale,
+stdio, the variadic stdio adapter, math core and string-to-floating-point
+conversion. TinyCC compiles the memory helper, exec and stdio extras.
+GCC and its assembler supply eleven.
 The staged nelinker writes the indexed archive and links the Lua runtime.
 The seed SDK must be on an absolute path. Relative tool and output names
 are relative to the build directory.

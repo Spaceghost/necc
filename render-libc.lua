@@ -92,36 +92,40 @@ local target_headers = stamp(output('target-headers.stamp'), headers)
 local compiler_headers = stamp(output('gcc-headers.stamp'), gcc_headers)
 local nelua_frontend = stamp(output('nelua-frontend.stamp'), frontend)
 
--- Build the archive writer with the seed libc, before the new libc exists.
+-- Bootstrap once with the released full frontend. The bootstrap compiler's
+-- native backend emits both tools, and the new linker links the final necc.
+local tool_libs = {sdk .. '/libnelibc.a', sdk .. '/tcc/libtcc1.a'}
+local compiler_modules = {}
+local bootstrap_driver
+if necc_source then
+  for name in lfs.dir(necc_source) do
+    if name:match('%.nelua$') then compiler_modules[#compiler_modules + 1] = necc_source .. '/' .. name end
+  end
+  bootstrap_driver = output('necc-bootstrap')
+  edge(bootstrap_driver, {compiler_modules, nelua_frontend, target_headers, tool_libs},
+    'NECC_NELINKER= NECC_SYSROOT=' .. quote(sdk) .. ' ' ..
+    command({necc, '--release', '-L', necc_source, necc_source .. '/necc.nelua', '-o', bootstrap_driver}))
+end
+
 local archiver
 if arg[6] then
   local dir = absolute(arg[6]) .. '/src'
   local sources = {}
   files(dir, '%.nelua$', sources)
   archiver = output('nelinker')
-  edge(archiver, {sources, nelua_frontend, target_headers, {sdk .. '/libnelibc.a', sdk .. '/tcc/libtcc1.a'}},
-    'NECC_NELINKER= NECC_SYSROOT=' .. quote(sdk) .. ' ' ..
-    command({necc, '--release', '-L', dir, dir .. '/nelinker.nelua', '-o', archiver}))
+  local args = bootstrap_driver and {executable('necc-bootstrap'), '--native'} or {necc}
+  for _, word in ipairs({'--release', '-L', dir, dir .. '/nelinker.nelua', '-o', archiver}) do args[#args+1] = word end
+  edge(archiver, {sources, nelua_frontend, target_headers, tool_libs, {bootstrap_driver or necc}},
+    'NECC_NELINKER= NECC_SYSROOT=' .. quote(sdk) .. ' ' .. command(args))
 end
 
--- This opt-in bootstrap compiles the supplied full necc source with the
--- released driver and seed SDK. The resulting driver handles native C codegen
--- for the broader allowlist below; its own link still uses the seed TCC.
 local native_driver
-if necc_source then
-  local source_dir = necc_source
-  local modules = {}
-  for name in lfs.dir(source_dir) do
-    if name:match('%.nelua$') then modules[#modules + 1] = source_dir .. '/' .. name end
-  end
-  table.sort(modules)
-  native_driver = output('necc')
-  local native_driver_command = executable('necc')
-  local inputs = {modules, nelua_frontend, target_headers,
-    {necc, sdk .. '/nelua-lua', sdk .. '/libnelibc.a', tcc, sdk .. '/tcc/libtcc1.a'}}
-  edge(native_driver, inputs, 'NECC_SYSROOT=' .. quote(sdk) .. ' NECC_NELINKER= ' ..
-    command({necc, '--release', '-L', source_dir, source_dir .. '/necc.nelua', '-o', native_driver}))
-  native_driver = {target=native_driver, command=native_driver_command}
+if bootstrap_driver then
+  native_driver = {target=output('necc'), command=executable('necc')}
+  edge(native_driver.target, {compiler_modules, nelua_frontend, target_headers, tool_libs, {bootstrap_driver, archiver}},
+    'NECC_SYSROOT=' .. quote(sdk) .. ' NECC_NELINKER=' .. quote(executable('nelinker')) .. ' ' ..
+    command({executable('necc-bootstrap'), '--native', '--release', '-L', necc_source,
+      necc_source .. '/necc.nelua', '-o', native_driver.target}))
 end
 
 -- Keep the standalone TinyCC profile's archive order. Compiler runtime
@@ -201,7 +205,7 @@ local native_objects = {
 if native_driver then
   for _, name in ipairs({
       'alloc.nelua', 'alloc/standalone_exports.c', 'crypt_standalone.nelua', 'ctype.nelua', 'fenv_standalone.nelua',
-      'iconv_standalone.nelua', 'inet.nelua', 'ipc_adapter.c', 'locale_standalone.nelua', 'memory.nelua',
+      'iconv_standalone.nelua', 'inet.nelua', 'ipc_adapter.c', 'locale_standalone.nelua', 'math_core.nelua', 'memory.nelua',
       'mqueue_adapter.c', 'pwd_standalone.nelua', 'regex_standalone.nelua',
       'search_standalone.nelua', 'spawn_standalone.nelua',
       'stdio.nelua', 'stdio_startup_stub.c', 'stdio_varargs.c', 'stdlib_float.nelua',
