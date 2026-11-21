@@ -7,7 +7,9 @@ local function absolute(path)
 end
 
 assert(#arg == 3 or #arg == 4 or #arg == 5, 'usage: render-lua.lua NECC SYSROOT NELUA_SRC [OUTPUT_PREFIX [ARCHIVE_INPUT]]')
-local necc, sdk, tree = absolute(arg[1]), absolute(arg[2]), absolute(arg[3])
+-- Keep the input spelling for nebuild to match a relative compiler target.
+local compiler_input = arg[1]
+local necc, sdk, tree = absolute(compiler_input), absolute(arg[2]), absolute(arg[3])
 local prefix = arg[4] and arg[4]:gsub('/+$', '') or ''
 assert(not arg[4] or (prefix ~= '' and prefix:sub(1, 1) ~= '/' and not prefix:find('%s')),
   'output prefix must be a relative path without whitespace')
@@ -82,7 +84,7 @@ for _, unit in ipairs(units) do
   local file = src .. '/' .. unit
   local deps = dependencies(file)
   deps[#deps + 1] = tcc
-  deps[#deps + 1] = necc
+  deps[#deps + 1] = compiler_input
   edge(obj, deps, 'NECC_SYSROOT=' .. quote(sdk) .. ' ' ..
     command({necc, '-DNDEBUG', '-DLUA_USE_POSIX', '-DMAXRECLEVEL=400', '-isystem', src .. '/lua', '-c', file, '-o', obj}))
   objects[#objects + 1] = obj
@@ -110,7 +112,7 @@ elseif archive_override then
   edge(runtime, deps, command(args))
 else
   deps[#deps + 1] = tcc
-  deps[#deps + 1] = necc
+  deps[#deps + 1] = compiler_input
   edge(runtime, deps, 'NECC_SYSROOT=' .. quote(sdk) .. ' NECC_NELINKER= ' ..
     command({necc, '-o', runtime, table.unpack(objects)}))
 end

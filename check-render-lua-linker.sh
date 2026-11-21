@@ -42,8 +42,15 @@ install_runtime() {
     cp runtime/nelua-lua "$NECC_SYSROOT/nelua-lua"
 }
 
-NECC_NELINKER=libc/nelinker "$necc" --lua "$renderer" "$necc" "$NECC_SYSROOT" \
-    "$nelua_src" runtime > default.ne
+# The compiler does not exist at render time. Its relative graph target must
+# be built before any runtime object, even on a parallel clean build.
+cp "$necc" seed-necc
+render_staged() {
+    printf 'build libc/necc seed-necc\n\tcp seed-necc libc/necc\n'
+    NECC_NELINKER=libc/nelinker "$necc" --lua "$renderer" libc/necc "$NECC_SYSROOT" \
+        "$nelua_src" runtime "$@"
+}
+render_staged > default.ne
 target=$(sed -n 's/^build runtime\/nelua-lua //p' default.ne)
 case " $target " in
     *" libc/nelinker "*) ;;
@@ -62,11 +69,10 @@ fi
 NECC_NELINKER=/not/the/rendered/linker "$nebuild" -j 4 default.ne runtime/nelua-lua \
     > default.recipes
 test -x runtime/nelua-lua
-test -s default.recipes
+test "$(grep -Fc "'$out/libc/necc' '-DNDEBUG'" default.recipes)" -eq 42
 install_runtime
 
-NECC_NELINKER=libc/nelinker "$necc" --lua "$renderer" "$necc" "$NECC_SYSROOT" \
-    "$nelua_src" runtime libc/libnelibc.a > override.ne
+render_staged libc/libnelibc.a > override.ne
 target=$(sed -n 's/^build runtime\/nelua-lua //p' override.ne)
 case " $target " in
     *" libc/libnelibc.a "*" libc/nelinker "*) ;;
@@ -91,10 +97,18 @@ test "$(wc -l < linker-changed.recipes)" -eq 1
 grep -F "'$out/libc/nelinker'" linker-changed.recipes >/dev/null
 install_runtime
 
+touch seed-necc
+"$nebuild" -j 4 override.ne runtime/nelua-lua > compiler-changed.recipes
+test "$(wc -l < compiler-changed.recipes)" -eq 44
+test "$(grep -Fc "'$out/libc/necc' '-DNDEBUG'" compiler-changed.recipes)" -eq 42
+"$nebuild" override.ne runtime/nelua-lua > warm.recipes
+test ! -s warm.recipes
+install_runtime
+
 cat > hello.nelua <<'NELUA'
 print(6 * 7)
 NELUA
 NECC_NELINKER=$out/libc/nelinker "$necc" --release hello.nelua -o hello
 test "$(./hello)" = 42
 "$NECC_SYSROOT/nelua-lua" -e 'assert(_VERSION == "Lua 5.4")'
-printf 'Lua runtime linked by the pinned Nelua linker; relative archive and linker changes rebuilt only the final link.\n'
+printf 'The staged necc rebuilt 42 runtime objects. Archive and linker changes rebuilt only the final link.\n'

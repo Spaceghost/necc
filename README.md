@@ -146,7 +146,9 @@ From an empty output directory, generate the dependency graph and run it:
 
 Every original translation unit in the bundled Lua 5.4.6 runtime and Nelua C
 extensions goes through the native C frontend. The release configuration has
-42 translation units, including one empty debug-print unit. TinyCC supplies
+42 translation units, including one empty debug-print unit. A relative compiler
+argument can name a target in the same nebuild graph. Its producer runs
+before the runtime objects and changes to the compiler rebuild them. TinyCC supplies
 dependency discovery, preprocessing and assembly. To link the runtime with
 nelinker, set `NECC_NELINKER` when generating the graph. The graph records
 that executable as a link dependency. Leaving the variable empty selects the
@@ -217,7 +219,7 @@ are relative to the build directory.
 {
   "$NECC" --lua "$NECC_SRC/render-libc.lua" "$NECC" "$NECC_SYSROOT" \
     "$NELIBC_SRC" "$(command -v gcc)" libc "$NELINKER_SRC" "$NECC_SRC"
-  NECC_NELINKER=libc/nelinker "$NECC" --lua "$NECC_SRC/render-lua.lua" "$NECC" "$NECC_SYSROOT" \
+  NECC_NELINKER=libc/nelinker "$NECC" --lua "$NECC_SRC/render-lua.lua" libc/necc "$NECC_SYSROOT" \
     "$NELUA_SRC" runtime libc/libnelibc.a
   printf 'default runtime/nelua-lua\n'
 } > build.ne
