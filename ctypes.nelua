@@ -21,7 +21,7 @@ global ct.Members = @sequence(ct.Member)
 local Form = @enum{Pointer=0, Record, Union, Function, Array}
 local Descriptor = @record{
   form: Form, element: Id, size: integer, alignment: integer,
-  count: integer, signature: ct.Signature, members: ct.Members
+  count: integer, complete: boolean, signature: ct.Signature, members: ct.Members
 }
 local derived: sequence(Descriptor)
 local pointers: hashmap(Id, Id)
@@ -46,6 +46,13 @@ function ct.is_function(t: Id): boolean return form(t, Form.Function) end
 function ct.is_array(t: Id): boolean return form(t, Form.Array) end
 function ct.is_integer(t: Id): boolean return t >= K.Bool and t <= K.ULLong end
 
+function ct.is_complete(t: Id): boolean
+  if t <= last_builtin then return t ~= K.Unknown and t ~= K.Void end
+  local item = &derived[t-last_builtin]
+  if item.form == Form.Record or item.form == Form.Union then return item.complete end
+  return item.form == Form.Pointer or (item.form == Form.Array and item.complete)
+end
+
 function ct.floating(t: Id): boolean return t == K.Float or t == K.Double end
 
 function ct.unsigned(t: Id): boolean
@@ -63,7 +70,8 @@ function ct.size(t: Id): integer
 end
 
 function ct.align(t: Id): integer
-  return t > last_builtin and derived[t-last_builtin].alignment or ct.size(t)
+  if t > last_builtin then return derived[t-last_builtin].alignment end
+  return ct.size(t)
 end
 
 function ct.promote(t: Id): Id
@@ -98,7 +106,7 @@ function ct.array(t: Id, count: integer): Id
   if ct.size(t) == 0 or count < 0 or count > 9223372036854775807 // ct.size(t) then return K.Unknown end
   local key = tostring(t) .. ':' .. tostring(count)
   if not arrays:has(key) then
-    arrays[key] = register({form=Form.Array, element=t, size=count*ct.size(t), alignment=ct.align(t), count=count})
+    arrays[key] = register({form=Form.Array, element=t, size=count*ct.size(t), alignment=ct.align(t), count=count, complete=count > 0})
   end
   return arrays[key]
 end
@@ -116,14 +124,14 @@ function ct.tag(word: string, name: string): Id
 end
 
 function ct.complete(t: Id, members: *ct.Members): boolean
-  if not ct.is_record(t) or #($members) == 0 then return false end
+  if not ct.is_record(t) or derived[t-last_builtin].complete then return false end
   local size, alignment: integer = 0, 1
   local overlap = form(t, Form.Union)
   for i: usize = 1, #($members) do
     local field = &($members)[i]
     local k = field.kind
     local a, n = ct.align(k), ct.size(k)
-    if n <= 0 or a <= 0 then return false end
+    if not ct.is_complete(k) or n < 0 or a <= 0 then return false end
     if a > alignment then alignment = a end
     if overlap then
       field.offset = 0
@@ -138,6 +146,7 @@ function ct.complete(t: Id, members: *ct.Members): boolean
   item.size = ((size+alignment-1)//alignment)*alignment
   item.alignment = alignment
   item.members = $members
+  item.complete = true
   return true
 end
 

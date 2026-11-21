@@ -224,8 +224,9 @@ local function primary(c: *Cursor): Value
       end
       if not take(c, ')') then return {} end
     end
+    if not ct.is_complete(k) then return {} end
     local n = w == 'sizeof' and ct.size(k) or ct.align(k)
-    if n <= 0 then return {} end
+    if n < 0 then return {} end
     return value(n, K.ULong)
   elseif w == '(' then
     local kind = type_operand(c, ')')

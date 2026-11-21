@@ -6,10 +6,69 @@ if [ "$#" -ne 3 ]; then
 fi
 necc=$1
 export NECC_SYSROOT=$2
+cc=${CC:-cc}
 mkdir -p "$3"
 out=$(mktemp -d "$3/sysv.XXXXXXXX")
 export TMPDIR=$out TMP=$out TEMP=$out
 cd "$out"
+
+cat > empty-records.c <<'C'
+#include <stddef.h>
+struct Empty {};
+struct OtherEmpty {};
+struct EmptyFirst { struct Empty empty; char value; };
+struct EmptyTail { char value; struct Empty empty; };
+union EmptyUnion { struct Empty empty; };
+struct EmptyMixed { char first; struct Empty empty; long last; };
+struct EmptySequence { void *impl; struct Empty allocator; };
+_Static_assert(sizeof(struct Empty) == 0 && _Alignof(struct Empty) == 1, "GNU empty record");
+_Static_assert(sizeof(struct OtherEmpty) == 0 && _Alignof(struct OtherEmpty) == 1, "distinct empty tag");
+_Static_assert(sizeof(struct EmptyFirst) == 1 && _Alignof(struct EmptyFirst) == 1, "empty first member");
+_Static_assert(sizeof(struct EmptyTail) == 1 && _Alignof(struct EmptyTail) == 1, "empty tail member");
+_Static_assert(offsetof(struct EmptyTail, empty) == 1, "empty tail offset");
+_Static_assert(sizeof(union EmptyUnion) == 0 && _Alignof(union EmptyUnion) == 1, "empty union member");
+_Static_assert(sizeof(struct EmptyMixed) == 16 && _Alignof(struct EmptyMixed) == 8 &&
+    offsetof(struct EmptyMixed, empty) == 1 && offsetof(struct EmptyMixed, last) == 8, "empty mixed layout");
+_Static_assert(sizeof(struct EmptySequence) == 8 && _Alignof(struct EmptySequence) == 8, "empty tail does not grow pointer record");
+C
+"$necc" -c empty-records.c -o empty-records.o
+printf '%s\n' 'struct Holder { int values[]; }; static struct Holder holder;' > incomplete-array-member.c
+if "$necc" -c incomplete-array-member.c -o incomplete-array-member.o 2>error; then
+    echo 'expected an incomplete array member to be rejected' >&2
+    exit 1
+fi
+printf '%s\n' 'struct Opaque; void assign(struct Opaque *a, struct Opaque *b) { *a = *b; }' > incomplete-assignment.c
+if "$necc" -c incomplete-assignment.c -o incomplete-assignment.o 2>error; then
+    echo 'expected an incomplete record assignment to be rejected' >&2
+    exit 1
+fi
+printf '%s\n' 'struct Opaque; struct Opaque value = {};' > incomplete-initializer.c
+if "$necc" -c incomplete-initializer.c -o incomplete-initializer.o 2>error; then
+    echo 'expected an incomplete record initializer to be rejected' >&2
+    exit 1
+fi
+
+cat > empty-values.c <<'C'
+struct Empty {};
+static int effects;
+static struct Empty empty_value(int amount) {
+    effects += amount;
+    return (struct Empty){};
+}
+static int consume(struct Empty ignored, int value) { return value; }
+static struct Empty global_empty = {};
+int main(void) {
+    struct Empty local = {};
+    struct Empty *address = &local;
+    local = empty_value(2);
+    if (effects != 2 || address != &local) return 1;
+    if (consume(empty_value(3), 42) != 42 || effects != 5) return 2;
+    return sizeof(global_empty) != 0;
+}
+C
+"$necc" -c empty-values.c -o empty-values.o
+"$cc" -no-pie empty-values.o -o empty-values
+./empty-values
 
 cat > shared.h <<'C'
 #include <stdarg.h>
@@ -133,7 +192,6 @@ int main(void) {
     return 0;
 }
 C
-cc=${CC:-cc}
 printf '%s\n' '_Static_assert(0 && (1 / 0), "wrong target");' > wrong.c
 if "$necc" -c wrong.c -o wrong.o 2>error; then exit 1; fi
 grep -q 'static assertion failed.*wrong target' error

@@ -250,7 +250,9 @@ end
 
 local function reserve(k: Id): integer
   local size,alignment=ct.size(k),ct.align(k)
-  if size <= 0 or alignment <= 0 then fail('incomplete object type') end
+  if not ct.is_complete(k) or alignment <= 0 then fail('incomplete object type') end
+  if size == 0 and ct.is_record(k) then size=1 end -- GNU empty records still need an addressable scratch byte.
+  if size <= 0 then fail('incomplete object type') end
   if alignment < 8 then alignment=8 end
   slots=((slots+size+alignment-1)//alignment)*alignment
   return slots
@@ -447,7 +449,8 @@ end
 
 -- The right-hand record address is in RAX and the destination address in RDX.
 local function copy_record(target: Id, source_kind: Id)
-  if target ~= source_kind or ct.size(target) == 0 then fail('incompatible record assignment') end
+  if target ~= source_kind or not ct.is_complete(target) then fail('incompatible record assignment') end
+  if ct.size(target) == 0 then emit('movq %rdx, %rax'); return end
   uses_string_copy = true
   emit('movq %rax, %rsi')
   emit('movq %rdx, %rdi')
@@ -526,11 +529,13 @@ end
 
 local function record_classes(k: Id, parts: *[2]Id): integer
   local count = ct.abi_parts(k, parts)
+  if count == 0 and ct.is_complete(k) and ct.size(k) == 0 then return 0 end
   if count == 0 then fail('unsupported aggregate calling convention') end
   return count
 end
 
 local function place_record(abi: *Abi, k: Id, locations: *sequence(Placement))
+  if ct.size(k) == 0 then return end -- The SysV ABI ignores empty record parameters.
   local parts: [2]Id
   local count = record_classes(k, &parts)
   local gp, sse: integer = 0, 0
@@ -564,6 +569,7 @@ local function load_record_piece(k: Id, i: integer)
 end
 
 local function transfer_record_result(k: Id, returning: boolean)
+  if ct.size(k) == 0 then return end -- The SysV ABI returns empty records without register pieces.
   local parts: [2]Id
   local count = record_classes(k, &parts)
   local slot: integer = 0
@@ -618,7 +624,9 @@ local function call(target: Expr): Expr
       logical_count = logical_count + 1
       if ct.is_record(k) then
         if value(e).kind ~= k then fail('incompatible record argument') end
-        if abi.ms then
+        if ct.size(k) == 0 and not abi.ms then
+          -- Keep expression side effects, but GNU SysV assigns no argument location.
+        elseif abi.ms then
           if ms_indirect(k) then
             local slot = ms_temporary(k)
             emit('leaq ' .. address(slot) .. ', %rdx'); copy_record(k,k)
@@ -875,8 +883,8 @@ function unary(): Expr
       else k=expression(1).kind; expect(')') end
     else k=unary().kind end
     while #body > mark do body:pop() end
+    if not ct.is_complete(k) then fail('size requires a complete object type') end
     local n=op == 'sizeof' and ct.size(k) or ct.align(k)
-    if n == 0 then fail('size requires a complete object type') end
     immediate(n)
     return {kind=Kind.ULong}
   elseif take('(') then
@@ -1392,7 +1400,7 @@ local function global_init(k: Id, out: *sequence(string)): Id
   elseif ct.is_record(k) or ct.is_array(k) then
     if consume_zero_brace_initializer() then
       if ct.is_array(k) and ct.count(k) == 0 then k=ct.array(ct.element(k),1) end
-      if ct.size(k) == 0 then fail('initializer needs a complete type') end
+      if not ct.is_complete(k) then fail('initializer needs a complete type') end
       space(out,ct.size(k))
       return k
     end
@@ -1410,7 +1418,7 @@ local function global_init(k: Id, out: *sequence(string)): Id
     end
     expect('}')
     if ct.is_array(k) and ct.count(k) == 0 then k = ct.array(ct.element(k), max_count) end
-    if ct.size(k) == 0 then fail('initializer needs a complete type') end
+    if not ct.is_complete(k) then fail('initializer needs a complete type') end
     local offset: integer = 0
     for i: usize = 1, #fragments do
       local fragment = &fragments[i]
@@ -1885,7 +1893,7 @@ function decl_group(top: boolean)
         object_start(v,out)
         if take('=') then v.kind=global_init(d.kind,out)
         else
-          if ct.size(d.kind) <= 0 then fail('incomplete static object') end
+          if not ct.is_complete(d.kind) then fail('incomplete static object') end
           space(out,ct.size(d.kind))
         end
         out:push('.size ' .. v.symbol .. ', .-' .. v.symbol)
@@ -1960,7 +1968,7 @@ local function compile_unit(path: string, destination: string, roots: *sequence(
     local v=variables[tentative[i]]
     if not v.defined then
       if ct.is_array(v.kind) and ct.count(v.kind) == 0 then v.kind=ct.array(ct.element(v.kind),1) end
-      if ct.size(v.kind) <= 0 then fail('incomplete tentative definition ' .. v.symbol) end
+      if not ct.is_complete(v.kind) then fail('incomplete tentative definition ' .. v.symbol) end
       local out=v.readonly and &rodata or &data
       object_start(v,out); space(out,ct.size(v.kind)); out:push('.size ' .. v.symbol .. ', .-' .. v.symbol)
     end
