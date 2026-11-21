@@ -265,7 +265,7 @@ local function ms_indirect(k: Id): boolean
   local n = ct.size(k)
   return n ~= 1 and n ~= 2 and n ~= 4 and n ~= 8
 end
-local function ms_temporary(k: Id): integer
+local function aggregate_temporary(k: Id): integer
   reserve(k)
   slots = ((slots+15)//16)*16
   return slots
@@ -604,9 +604,19 @@ local function record_classes(k: Id, parts: *[2]Id): integer
 end
 
 local function place_record(abi: *Abi, k: Id, locations: *sequence(Placement))
-  if ct.size(k) == 0 then return end -- The SysV ABI ignores empty record parameters.
+  if ct.is_complete(k) and ct.size(k) == 0 then return end -- The SysV ABI ignores empty record parameters.
   local parts: [2]Id
-  local count = record_classes(k, &parts)
+  local count = ct.abi_parts(k, &parts)
+  if count == 0 and ct.memory_aggregate(k) then
+    -- MEMORY-class aggregates are copied to the stack as rounded eightbytes.
+    -- Each piece remains associated with the original record at the call site,
+    -- where load_record_piece zero-extends a short final piece safely.
+    count = (ct.size(k)+7)//8
+    abi.stack = abi.stack + count
+    for i = 0, count-1 do locations:push({kind=Kind.ULong}) end
+    return
+  end
+  if count == 0 then fail('unsupported aggregate calling convention') end
   local gp, sse: integer = 0, 0
   for i = 0, count-1 do
     if ct.floating(parts[i]) then sse = sse + 1 else gp = gp + 1 end
@@ -676,8 +686,9 @@ local function call(target: Expr): Expr
   local logical_count: integer = 0
   local abi: Abi = {ms=sig.ms_abi}
   local returned: integer = 0
-  if sig.ms_abi and ms_indirect(sig.result) then
-    returned = ms_temporary(sig.result)
+  local sysv_memory_return = not sig.ms_abi and ct.memory_aggregate(sig.result)
+  if (sig.ms_abi and ms_indirect(sig.result)) or sysv_memory_return then
+    returned = aggregate_temporary(sig.result)
     emit('leaq ' .. address(returned) .. ', %rax')
     args:push(place(&abi,ct.pointer(sig.result))); push_result()
   end
@@ -697,7 +708,7 @@ local function call(target: Expr): Expr
           -- Keep expression side effects, but GNU SysV assigns no argument location.
         elseif abi.ms then
           if ms_indirect(k) then
-            local slot = ms_temporary(k)
+            local slot = aggregate_temporary(k)
             emit('leaq ' .. address(slot) .. ', %rdx'); copy_record(k,k)
           else emit('movq %rax, %r11'); load_record_piece(k,0) end
           args:push(place(&abi,Kind.ULong)); push_result()
@@ -760,7 +771,9 @@ local function call(target: Expr): Expr
   if reclaim > 0 then emit('addq $' .. tostring(reclaim*8) .. ', %rsp') end
   args:destroy()
   if ct.is_record(sig.result) then
-    if abi.ms then
+    if sysv_memory_return then
+      emit('leaq ' .. address(returned) .. ', %rax')
+    elseif abi.ms then
       if returned == 0 then returned = reserve(sig.result); emit('movq %rax, ' .. address(returned)) end
       emit('leaq ' .. address(returned) .. ', %rax')
     else transfer_record_result(sig.result, false) end
@@ -1872,10 +1885,9 @@ function statement(ret: string)
   elseif take('return') then
     if ct.is_record(function_result) then
       if value(expression(1)).kind ~= function_result then fail('incompatible record return') end
-      if function_ms then
-        if indirect_result_slot ~= 0 then
-          emit('movq ' .. address(indirect_result_slot) .. ', %rdx'); copy_record(function_result,function_result)
-        else emit('movq %rax, %r11'); load_record_piece(function_result,0) end
+      if indirect_result_slot ~= 0 then
+        emit('movq ' .. address(indirect_result_slot) .. ', %rdx'); copy_record(function_result,function_result)
+      elseif function_ms then emit('movq %rax, %r11'); load_record_piece(function_result,0)
       else transfer_record_result(function_result, true) end
     elseif function_result ~= Kind.Void then convert(expression(1),function_result,false)
     elseif token ~= ';' then
@@ -1892,7 +1904,10 @@ local function compile_function(d: headers.Declaration)
   slots, va_save_slot, indirect_result_slot = 0, 0, 0
   function_ms, calls_sysv, uses_string_copy = sig.ms_abi, false, false
   local abi: Abi = {ms=sig.ms_abi}
-  if sig.ms_abi and ms_indirect(sig.result) then
+  if not sig.ms_abi and ct.memory_aggregate(sig.result) then
+    indirect_result_slot = reserve(ct.pointer(sig.result))
+    emit('movq %rdi, ' .. address(indirect_result_slot)); abi.gp = 1
+  elseif sig.ms_abi and ms_indirect(sig.result) then
     indirect_result_slot = reserve(ct.pointer(sig.result))
     emit('movq %rcx, ' .. address(indirect_result_slot)); abi.gp = 1
   end

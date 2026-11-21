@@ -86,10 +86,30 @@ typedef struct { int tag; double value; } Tagged;
 typedef struct { double a, b; } Reals;
 typedef struct { long a, b; } Integers;
 typedef struct { unsigned char bytes[3]; } Three;
+typedef struct { long a, b, c; } Large;
+typedef struct { double a, b, c; } LargeReals;
+typedef struct { float a, b, c, d, e; } LargeFloats;
+typedef struct { void *a, *b, *c; } LargePointers;
+typedef struct { int tag; double value; long tail; } LargeMixed;
+typedef struct { Large value; double tail; } NestedLarge;
+typedef struct { unsigned char data[17]; } LargeBytes;
 Vector vector(Vector v);
 Tagged tagged(Tagged t);
 Reals reals(Reals v);
 Three three(Three t);
+Large make_large(long seed);
+Large spill_return(long a, long b, long c, long d, long e, long f);
+Large nested_large(long seed);
+LargeReals make_large_reals(double seed);
+LargeReals shift_large_reals(LargeReals value, double extra);
+LargeFloats make_large_floats(float seed);
+LargePointers make_large_pointers(void *a, void *b, void *c);
+LargeMixed make_large_mixed(long seed, double value);
+NestedLarge make_nested_large(long seed);
+long consume_large(Large value, long after);
+long consume_large_after_gp(long a, long b, long c, long d, long e, long f,
+                            Large value, long after);
+int consume_large_bytes(LargeBytes value);
 long spill_gp(long, long, long, long, long, Integers, long);
 double spill_sse(double, double, double, double, double, double, double, Reals, double);
 double scan(int count, ...);
@@ -110,6 +130,37 @@ Vector vector(Vector v) { v.x += 1; v.y += 2; v.tag += 3; return v; }
 Tagged tagged(Tagged t) { t.tag += 4; t.value += 0.25; return t; }
 Reals reals(Reals v) { return (Reals){.b = v.a, .a = v.b}; }
 Three three(Three t) { t.bytes[1]++; return t; }
+Large make_large(long seed) { return (Large){seed, seed + 1, seed + 2}; }
+Large spill_return(long a, long b, long c, long d, long e, long f) {
+    return (Large){a + b, c + d, e + f};
+}
+Large nested_large(long seed) {
+    Large value = make_large(seed);
+    value.b += 10;
+    return value;
+}
+LargeReals make_large_reals(double seed) { return (LargeReals){seed, seed + 0.5, seed + 1.0}; }
+LargeReals shift_large_reals(LargeReals value, double extra) {
+    return (LargeReals){value.a + extra, value.b + extra, value.c + extra};
+}
+LargeFloats make_large_floats(float seed) {
+    return (LargeFloats){seed, seed + 1.0f, seed + 2.0f, seed + 3.0f, seed + 4.0f};
+}
+LargePointers make_large_pointers(void *a, void *b, void *c) { return (LargePointers){a, b, c}; }
+LargeMixed make_large_mixed(long seed, double value) {
+    return (LargeMixed){(int)seed, value, seed + 20};
+}
+NestedLarge make_nested_large(long seed) {
+    return (NestedLarge){make_large(seed), seed + 0.25};
+}
+long consume_large(Large value, long after) {
+    return value.a + value.b + value.c + after;
+}
+long consume_large_after_gp(long a, long b, long c, long d, long e, long f,
+                            Large value, long after) {
+    return a + b + c + d + e + f + value.a + value.b + value.c + after;
+}
+int consume_large_bytes(LargeBytes value) { return value.data[0] + value.data[16]; }
 long spill_gp(long a, long b, long c, long d, long e, Integers t, long last) {
     return a+b+c+d+e+t.a+t.b+last;
 }
@@ -182,6 +233,33 @@ int main(void) {
     if (swapped.a != 7.5 || swapped.b != 3.25) return 9;
     Three bytes = three((Three){{11, 22, 33}});
     if (bytes.bytes[0] != 11 || bytes.bytes[1] != 23 || bytes.bytes[2] != 33) return 10;
+    Large large = make_large(5);
+    if (large.a != 5 || large.b != 6 || large.c != 7) return 13;
+    Large spilled_return = spill_return(1, 2, 3, 4, 5, 6);
+    if (spilled_return.a != 3 || spilled_return.b != 7 || spilled_return.c != 11) return 14;
+    Large nested = nested_large(7);
+    if (nested.a != 7 || nested.b != 18 || nested.c != 9) return 15;
+    LargeReals large_reals = make_large_reals(1.25);
+    if (large_reals.a != 1.25 || large_reals.b != 1.75 || large_reals.c != 2.25) return 16;
+    LargeReals shifted_reals = shift_large_reals(large_reals, 2.0);
+    if (shifted_reals.a != 3.25 || shifted_reals.b != 3.75 || shifted_reals.c != 4.25) return 22;
+    LargeFloats large_floats = make_large_floats(0.5f);
+    if (large_floats.a != 0.5f || large_floats.b != 1.5f || large_floats.c != 2.5f ||
+        large_floats.d != 3.5f || large_floats.e != 4.5f) return 23;
+    LargePointers large_pointers = make_large_pointers(&large, &large_reals, &nested);
+    if (large_pointers.a != &large || large_pointers.b != &large_reals ||
+        large_pointers.c != &nested) return 24;
+    LargeMixed large_mixed = make_large_mixed(12, 4.5);
+    if (large_mixed.tag != 12 || large_mixed.value != 4.5 || large_mixed.tail != 32) return 17;
+    NestedLarge nested_aggregate = make_nested_large(9);
+    if (nested_aggregate.value.a != 9 || nested_aggregate.value.b != 10 ||
+        nested_aggregate.value.c != 11 || nested_aggregate.tail != 9.25) return 18;
+    if (consume_large(large, 4) != 22) return 19;
+    if (consume_large_after_gp(1, 2, 3, 4, 5, 6, large, 7) != 46) return 20;
+    LargeBytes large_bytes = {{0}};
+    large_bytes.data[0] = 5;
+    large_bytes.data[16] = 17;
+    if (consume_large_bytes(large_bytes) != 22) return 21;
     if (spill_gp(1,2,3,4,5,(Integers){6,7},8) != 36) return 11;
     if (spill_sse(1,2,3,4,5,6,7,(Reals){8,9},10) != 55) return 12;
     double (*callback)(int, ...) = scan;
@@ -196,6 +274,26 @@ int main(void) {
     double zero = 0, nan = zero / zero;
     if (!nan || nan == nan || nan < 1. || nan >= 1. || !(nan != 1.)) return 6;
     return 0;
+}
+C
+cat > return_pointer.c <<'C'
+#include "shared.h"
+#include <stdint.h>
+
+int forward(const char *s, va_list ap) { (void)s; (void)ap; return 0; }
+
+int main(void) {
+    Large out;
+    Large *destination = &out;
+    long seed = 31;
+    uintptr_t returned;
+    __asm__ volatile("call make_large"
+        : "=a"(returned), "+D"(destination), "+S"(seed)
+        :
+        : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory", "cc",
+          "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+          "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15");
+    return returned != (uintptr_t)&out || out.a != 31 || out.b != 32 || out.c != 33;
 }
 C
 printf '%s\n' '_Static_assert(0 && (1 / 0), "wrong target");' > wrong.c
@@ -213,3 +311,7 @@ for caller in native reference; do
         printf 'SysV caller %s, callee %s passed\n' "$caller" "$function"
     done
 done
+"$cc" -std=c11 -O2 -fno-pie -fno-stack-protector -c return_pointer.c -o return_pointer.o
+"$necc" return_pointer.o functions-native.o -o return_pointer
+./return_pointer
+printf 'SysV MEMORY return pointer in RAX passed\n'

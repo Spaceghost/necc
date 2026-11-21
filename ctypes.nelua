@@ -202,6 +202,26 @@ function ct.abi_parts(t: Id, parts: *[2]Id): integer
   return (size + 7) // 8
 end
 
+-- SysV returns aggregates larger than two eightbytes through a hidden result
+-- pointer when their leaves use the INTEGER or SSE classes. Keep this separate
+-- from `abi_parts`: these objects are memory-class returns, not register pieces.
+local function memory_leaves(t: Id): boolean
+  if ct.is_array(t) then
+    return memory_leaves(ct.element(t))
+  elseif ct.is_record(t) then
+    local members = ct.members(t)
+    for i: usize = 1, #($members) do
+      if not memory_leaves(($members)[i].kind) then return false end
+    end
+    return true
+  end
+  return ct.is_integer(t) or ct.is_pointer(t) or ct.floating(t)
+end
+
+function ct.memory_aggregate(t: Id): boolean
+  return ct.is_record(t) and ct.size(t) > 16 and ct.align(t) <= 8 and memory_leaves(t)
+end
+
 function ct.function_type(sig: ct.Signature): Id
   local key = (sig.ms_abi and 'ms' or 'sysv') .. tostring(sig.result) .. (sig.unspecified and '?' or (sig.variadic and 'v' or 'f'))
   for i: usize = 1, #sig.parameters do key = key .. '/' .. tostring(sig.parameters[i]) end
