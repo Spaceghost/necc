@@ -19,7 +19,7 @@ The compiler builds each source in private temporary storage and installs the
 executable after every compilation and the link succeed. Compile an individual
 source with `-c` to retain its object file.
 
-The C frontend is written in Nelua and emits x86-64 System V assembly.
+The C frontend is written in Nelua and emits x86-64 assembly using System V by default.
 For C, the SDK's static TinyCC handles preprocessing, assembly and linking.
 The default Nelua path uses the Spaceghost frontend and TinyCC as its C
 backend. `necc --native` sends the full frontend's generated C through necc
@@ -65,6 +65,30 @@ Full Nelua builds accept `--release`, module directories with `-L`, and
 frontend definitions with `--define`. C builds accept `-I`, `-D`,
 `-U` and `-isystem`. The native frontend imports supported ABI declarations
 from headers in explicit system directories.
+
+## UEFI x86-64 calling convention
+
+Use `__attribute__((ms_abi))` on an EFI entry point and on the function type
+of each firmware service. The convention follows the type through pointers,
+structure fields and indirect calls.
+
+```c
+typedef unsigned long (__attribute__((ms_abi)) *output_string)(void *, unsigned short *);
+struct console { void *reset; output_string write; };
+
+unsigned long __attribute__((ms_abi)) efi_main(void *image, void *system_table);
+```
+
+Compile freestanding generated C with `necc -c loader.c -o loader.o` to
+produce the ELF input for an EFI linker. The native backend uses positional
+integer and scalar floating-point arguments, the four-slot home area,
+caller-owned aggregate copies, and Microsoft x64 nonvolatile registers.
+Use fixed-width scalar types for UEFI data structures. This function attribute
+selects a calling convention within the compiler's LP64 C data model.
+
+`make test-sdk` checks native and reference callers and callees in both
+directions. An assembly fixture exercises stack alignment, writes every home
+slot, and checks register preservation across a call into System V code.
 
 ## Native C coverage
 

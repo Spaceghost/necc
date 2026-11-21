@@ -33,7 +33,7 @@ local inside_header: boolean
 local sdk = os.getenv('NECC_SYSROOT')
 if #sdk == 0 then sdk = '/usr/lib/necc' end
 local Variable = @record{slot: integer, kind: Id, level: integer, symbol: string,
-                         readonly: boolean, internal: boolean, defined: boolean, tentative: boolean}
+                         readonly: boolean, internal: boolean, defined: boolean, tentative: boolean, indirect: boolean}
 local Binding = @record{name: string, previous: Variable}
 local bindings: sequence(Binding)
 local variables: hashmap(string, Variable)
@@ -44,6 +44,10 @@ local rodata: sequence(string)
 local constants: sequence(string)
 local scope: integer = 1
 local function_result: Id
+local function_ms: boolean
+local indirect_result_slot: integer
+local calls_sysv: boolean
+local uses_string_copy: boolean
 local break_to: string
 local continue_to: string
 local assembly: sequence(string)
@@ -52,6 +56,11 @@ local slots: integer
 local depth: integer
 local label_count: integer
 local wide_registers: []string = {'%rdi', '%rsi', '%rdx', '%rcx', '%r8', '%r9'}
+
+local ms_registers: []string = {'%rcx','%rdx','%r8','%r9'}
+local function argument_register(ms: boolean, reg: integer): string
+  return ms and ms_registers[reg-1] or wide_registers[reg-1]
+end
 
 local function fail(message: string): void <noreturn>
   io.stderr:write('necc: ' .. source_path .. ':' .. tostring(token_line) .. ': ' .. message .. '\n')
@@ -247,6 +256,19 @@ local function reserve(k: Id): integer
   return slots
 end
 
+-- Windows x64 requires a caller-owned, 16-byte aligned copy for an
+-- aggregate whose size is not 1, 2, 4 or 8 bytes.
+local function ms_indirect(k: Id): boolean
+  if not ct.is_record(k) then return false end
+  local n = ct.size(k)
+  return n ~= 1 and n ~= 2 and n ~= 4 and n ~= 8
+end
+local function ms_temporary(k: Id): integer
+  reserve(k)
+  slots = ((slots+15)//16)*16
+  return slots
+end
+
 local function allocate(name: string,k: Id,readonly: boolean): Variable
   return bind_local(name,{slot=reserve(k),kind=k,readonly=readonly})
 end
@@ -426,6 +448,7 @@ end
 -- The right-hand record address is in RAX and the destination address in RDX.
 local function copy_record(target: Id, source_kind: Id)
   if target ~= source_kind or ct.size(target) == 0 then fail('incompatible record assignment') end
+  uses_string_copy = true
   emit('movq %rax, %rsi')
   emit('movq %rdx, %rdi')
   emit('movq $' .. tostring(ct.size(target)) .. ', %rcx')
@@ -480,7 +503,7 @@ local function zero_local(k: Id, slot: integer)
 end
 
 local Placement = @record{kind: Id, reg: integer}
-local Abi = @record{gp: integer, sse: integer, stack: integer}
+local Abi = @record{ms: boolean, gp: integer, sse: integer, stack: integer}
 
 -- INTEGER and SSE arguments have independent register sequences in SysV.
 local va_record: Id
@@ -489,7 +512,10 @@ local va_fixed: Abi
 local va_last: string
 
 local function place(abi: *Abi,k: Id): Placement
-  if ct.floating(k) then
+  if abi.ms then
+    if not scalar(k) then fail('unsupported Microsoft x64 argument type') end
+    if abi.gp < 4 then abi.gp = abi.gp+1; return {kind=k, reg=abi.gp} end
+  elseif ct.floating(k) then
     if abi.sse < 8 then abi.sse=abi.sse+1; return {kind=k,reg=abi.sse} end
   elseif ct.is_integer(k) or ct.is_pointer(k) then
     if abi.gp < 6 then abi.gp=abi.gp+1; return {kind=k,reg=abi.gp} end
@@ -570,9 +596,16 @@ local function call(target: Expr): Expr
     push_result()
   end
   local sig=ct.signature(fn)
+  if not sig.ms_abi then calls_sysv = true end
   local args: sequence(Placement)
   local logical_count: integer = 0
-  local abi: Abi
+  local abi: Abi = {ms=sig.ms_abi}
+  local returned: integer = 0
+  if sig.ms_abi and ms_indirect(sig.result) then
+    returned = ms_temporary(sig.result)
+    emit('leaq ' .. address(returned) .. ', %rax')
+    args:push(place(&abi,ct.pointer(sig.result))); push_result()
+  end
   if not take(')') then
     repeat
       local e=expression(2)
@@ -585,10 +618,18 @@ local function call(target: Expr): Expr
       logical_count = logical_count + 1
       if ct.is_record(k) then
         if value(e).kind ~= k then fail('incompatible record argument') end
-        local first = #args
-        place_record(&abi, k, &args)
-        emit('movq %rax, %r11')
-        for i = 0, (@integer)(#args-first)-1 do load_record_piece(k, i); push_result() end
+        if abi.ms then
+          if ms_indirect(k) then
+            local slot = ms_temporary(k)
+            emit('leaq ' .. address(slot) .. ', %rdx'); copy_record(k,k)
+          else emit('movq %rax, %r11'); load_record_piece(k,0) end
+          args:push(place(&abi,Kind.ULong)); push_result()
+        else
+          local first = #args
+          place_record(&abi, k, &args)
+          emit('movq %rax, %r11')
+          for i = 0, (@integer)(#args-first)-1 do load_record_piece(k, i); push_result() end
+        end
       else
         convert(e, k, false); args:push(place(&abi, k)); push_result()
       end
@@ -597,12 +638,14 @@ local function call(target: Expr): Expr
   end
   local count=(@integer)(#args)
   if logical_count < sig.arity then fail('wrong number of arguments for ' .. target.symbol) end
+  local duplicate_fp = abi.ms and (sig.variadic or sig.unspecified)
   if abi.stack == 0 then
     for i=count,1,-1 do
       local a=args[i]
       if ct.floating(a.kind) then
         pop_result('%rax'); xmm_in(a.kind,'%xmm' .. tostring(a.reg-1))
-      else pop_result(wide_registers[a.reg-1]) end
+        if duplicate_fp then emit('movq %rax, ' .. argument_register(true,a.reg)) end
+      else pop_result(argument_register(abi.ms,a.reg)) end
     end
     if not direct then pop_result('%r11') end
   else
@@ -611,8 +654,10 @@ local function call(target: Expr): Expr
       local a=args[i]
       local src=tostring((count-i)*8) .. '(%r10)'
       if a.reg ~= 0 then
-        if ct.floating(a.kind) then emit('movq ' .. src .. ', %rax'); xmm_in(a.kind, '%xmm' .. tostring(a.reg-1))
-        else emit('movq ' .. src .. ', ' .. wide_registers[a.reg-1]) end
+        if ct.floating(a.kind) then
+          emit('movq ' .. src .. ', %rax'); xmm_in(a.kind, '%xmm' .. tostring(a.reg-1))
+          if duplicate_fp then emit('movq %rax, ' .. argument_register(true,a.reg)) end
+        else emit('movq ' .. src .. ', ' .. argument_register(abi.ms,a.reg)) end
       end
     end
     if not direct then emit('movq ' .. tostring(count*8) .. '(%r10), %r11') end
@@ -622,9 +667,10 @@ local function call(target: Expr): Expr
   for i=count,1,-1 do
     if args[i].reg == 0 then emit('pushq ' .. tostring((count-i)*8) .. '(%r10)') end
   end
-  if sig.variadic or sig.unspecified then emit('movl $' .. tostring(abi.sse) .. ', %eax') end
+  if abi.ms then emit('subq $32, %rsp')
+  elseif sig.variadic or sig.unspecified then emit('movl $' .. tostring(abi.sse) .. ', %eax') end
   emit('call ' .. (direct and target.symbol or '*%r11'))
-  local reclaim=pad and 1 or 0
+  local reclaim=(pad and 1 or 0) + (abi.ms and 4 or 0)
   if abi.stack > 0 then
     local saved=count+(direct and 0 or 1)
     depth=depth-saved; reclaim=reclaim+abi.stack+saved
@@ -632,7 +678,10 @@ local function call(target: Expr): Expr
   if reclaim > 0 then emit('addq $' .. tostring(reclaim*8) .. ', %rsp') end
   args:destroy()
   if ct.is_record(sig.result) then
-    transfer_record_result(sig.result, false)
+    if abi.ms then
+      if returned == 0 then returned = reserve(sig.result); emit('movq %rax, ' .. address(returned)) end
+      emit('leaq ' .. address(returned) .. ', %rax')
+    else transfer_record_result(sig.result, false) end
     return {kind=sig.result}
   end
   if sig.result ~= Kind.Void and not scalar(sig.result) then fail('unsupported call result') end
@@ -662,6 +711,9 @@ local function resolve(name: string): Expr
     else fail('undeclared local ' .. name) end
   end
   local place=v.slot ~= 0 and address(v.slot) or (v.symbol .. '(%rip)')
+  if v.indirect then
+    emit('movq ' .. place .. ', %rax'); return {kind=v.kind,lvalue=true}
+  end
   emit('leaq ' .. place .. ', %rax')
   return {kind=v.kind,lvalue=true,readonly=v.readonly,place=place,mark=#body}
 end
@@ -696,7 +748,34 @@ end
 
 local function variadic_builtin(op: string): Expr
   expect('(')
-  va_pointer()
+  local ap = expression(2)
+  -- The MS list points into a single contiguous run of eightbyte argument
+  -- homes. The System V list is an array containing a descriptor.
+  if ap.kind == ct.pointer(Kind.Char) and ap.lvalue then
+    if op == '__builtin_ms_va_start' then
+      if not function_ms or #va_last == 0 then fail('ms_va_start outside an MS variadic function') end
+      expect(',')
+      if identifier() ~= va_last then fail('va_start requires the last fixed parameter') end
+      expect(')')
+      emit('leaq ' .. tostring(16+(va_fixed.gp+va_fixed.stack)*8) .. '(%rbp), %rdx')
+      emit('movq %rdx, (%rax)')
+    elseif op == '__builtin_va_arg' then
+      expect(',')
+      local k = read_type()
+      if not scalar(k) or k == Kind.Float or (ct.is_integer(k) and ct.promote(k) ~= k) then
+        fail('unsupported or unpromoted Microsoft variadic argument type')
+      end
+      emit('movq (%rax), %rcx'); emit('addq $8, (%rax)'); load_memory(k,'(%rcx)')
+      return {kind=k}
+    elseif op == '__builtin_ms_va_copy' then
+      push_result(); expect(',')
+      if value(expression(2)).kind ~= ct.pointer(Kind.Char) then fail('invalid Microsoft va_list') end
+      expect(')'); pop_result('%rcx'); emit('movq %rax, (%rcx)')
+    elseif op == '__builtin_ms_va_end' then expect(')')
+    else fail('invalid builtin for Microsoft va_list') end
+    return {kind=Kind.Void}
+  end
+  if value(ap).kind ~= ct.pointer(va_record) then fail('expected va_list') end
   if op == '__builtin_va_start' then
     if va_save_slot == 0 then fail('va_start outside a variadic function') end
     expect(',')
@@ -742,7 +821,8 @@ end
 
 function unary(): Expr
   local op=token
-  if op == '__builtin_va_start' or op == '__builtin_va_arg' or op == '__builtin_va_copy' or op == '__builtin_va_end' then
+  if op == '__builtin_va_start' or op == '__builtin_va_arg' or op == '__builtin_va_copy' or op == '__builtin_va_end' or
+      op == '__builtin_ms_va_start' or op == '__builtin_ms_va_copy' or op == '__builtin_ms_va_end' then
     next_token()
     return postfix(variadic_builtin(op))
   elseif take('&') then
@@ -1119,6 +1199,17 @@ local function pointer_constant(words: *headers.Tokens, first: usize, last: usiz
       return symbol
     end
   end
+  if ($words)[first]:byte(1) == 34 then
+    if not compatible_pointer(ct.pointer(Kind.Char),k) then fail('incompatible string initializer') end
+    local bytes: sequence(byte)
+    for i = first,last do
+      if ($words)[i]:byte(1) ~= 34 then fail('expected string literal') end
+      literal_bytes(($words)[i],&bytes)
+    end
+    bytes:push(0)
+    local name = string_symbol(&bytes); bytes:destroy()
+    return name
+  end
   local addr=($words)[first] == '&'
   local at=addr and first+1 or first
   if at == last then
@@ -1281,10 +1372,6 @@ local function global_init(k: Id, out: *sequence(string)): Id
     space(out, ct.size(k)-offset)
   elseif take('{') then
     global_init(k,out); take(','); expect('}')
-  elseif ct.is_pointer(k) and #token > 0 and token:byte(1) == 34 then
-    if not compatible_pointer(ct.pointer(Kind.Char),k) then fail('incompatible string initializer') end
-    local bytes=strings()
-    out:push('  .quad ' .. string_symbol(&bytes)); bytes:destroy()
   else
     local words=read_constant()
     if ct.is_pointer(k) then
@@ -1395,7 +1482,7 @@ local function register_fn(d: headers.Declaration, definition: boolean): ct.Sign
   if functions:has(d.name) then
     local prev=functions[d.name]
     if (not prev.unspecified and not sig.unspecified and ct.function_type(prev) ~= d.kind) or
-        prev.result ~= sig.result or (d.internal and not prev.internal) then fail('conflicting declaration for ' .. d.name) end
+        prev.ms_abi ~= sig.ms_abi or prev.result ~= sig.result or (d.internal and not prev.internal) then fail('conflicting declaration for ' .. d.name) end
     if definition and prev.defined then fail('multiple definitions of ' .. d.name) end
     sig.internal=prev.internal; sig.defined=prev.defined
     if not definition and sig.unspecified and not prev.unspecified then return prev end
@@ -1447,7 +1534,7 @@ local function statement(ret: string) <forwarddecl> end
 local function decl_group(top: boolean) <forwarddecl> end
 
 local function starts_decl(): boolean
-  return token == '_Static_assert' or (headers.starts_type(token,&aliases) and locals[token].level == 0) or token == 'static' or
+  return token == '_Static_assert' or token == '__attribute__' or token == '__attribute' or (headers.starts_type(token,&aliases) and locals[token].level == 0) or token == 'static' or
     token == 'extern' or token == 'typedef' or token == 'inline' or token == 'register'
 end
 
@@ -1574,7 +1661,11 @@ function statement(ret: string)
   elseif take('return') then
     if ct.is_record(function_result) then
       if value(expression(1)).kind ~= function_result then fail('incompatible record return') end
-      transfer_record_result(function_result, true)
+      if function_ms then
+        if indirect_result_slot ~= 0 then
+          emit('movq ' .. address(indirect_result_slot) .. ', %rdx'); copy_record(function_result,function_result)
+        else emit('movq %rax, %r11'); load_record_piece(function_result,0) end
+      else transfer_record_result(function_result, true) end
     elseif function_result ~= Kind.Void then convert(expression(1),function_result,false)
     elseif token ~= ';' then
       if value(expression(1)).kind ~= Kind.Void then fail('unexpected return value') end
@@ -1586,8 +1677,16 @@ end
 
 local function compile_function(d: headers.Declaration)
   local sig=register_fn(d,true)
-  slots, va_save_slot = 0, 0
-  if sig.variadic then
+  slots, va_save_slot, indirect_result_slot = 0, 0, 0
+  function_ms, calls_sysv, uses_string_copy = sig.ms_abi, false, false
+  local abi: Abi = {ms=sig.ms_abi}
+  if sig.ms_abi and ms_indirect(sig.result) then
+    indirect_result_slot = reserve(ct.pointer(sig.result))
+    emit('movq %rcx, ' .. address(indirect_result_slot)); abi.gp = 1
+  end
+  if sig.variadic and sig.ms_abi then
+    for i = 0, 3 do emit('movq ' .. ms_registers[i] .. ', ' .. tostring(16+i*8) .. '(%rbp)') end
+  elseif sig.variadic then
     -- SysV register-save area: six GP slots, followed by eight 16-byte SSE slots.
     va_save_slot = reserve(ct.array(Kind.UChar, 176))
     for i = 0, 5 do emit('movq ' .. wide_registers[i] .. ', ' .. address(va_save_slot - i*8)) end
@@ -1596,28 +1695,32 @@ local function compile_function(d: headers.Declaration)
       emit('movq %rax, ' .. address(va_save_slot - 48 - i*16))
     end
   end
-  local abi: Abi
   for i: usize=1,#d.params do
     local p=d.params[i]
     if #p.name == 0 then fail('parameters must be named in a definition') end
-    local v = allocate(p.name, p.kind, false)
+    local v: Variable
+    if abi.ms and ms_indirect(p.kind) then
+      v = bind_local(p.name,{slot=reserve(ct.pointer(p.kind)),kind=p.kind,indirect=true})
+    else v = allocate(p.name,p.kind,false) end
     local incoming: sequence(Placement)
     local stack = abi.stack
-    if ct.is_record(p.kind) then place_record(&abi, p.kind, &incoming)
+    if abi.ms and ct.is_record(p.kind) then incoming:push(place(&abi,Kind.ULong))
+    elseif ct.is_record(p.kind) then place_record(&abi, p.kind, &incoming)
     else incoming:push(place(&abi, p.kind)) end
     for j: usize = 1, #incoming do
       local a = incoming[j]
       local dest = address(v.slot - (@integer)(j-1)*8)
       if a.reg == 0 then
-        emit('movq ' .. tostring(16 + stack*8) .. '(%rbp), %rax')
+        emit('movq ' .. tostring((abi.ms and 48 or 16) + stack*8) .. '(%rbp), %rax')
         emit('movq %rax, ' .. dest)
         stack = stack + 1
       elseif ct.floating(a.kind) then
         xmm_out(a.kind, '%xmm' .. tostring(a.reg-1)); store_memory(a.kind, dest)
-      else emit('movq ' .. wide_registers[a.reg-1] .. ', ' .. dest) end
+      else emit('movq ' .. argument_register(abi.ms,a.reg) .. ', ' .. dest) end
     end
     incoming:destroy()
   end
+  va_last = ''
   if sig.variadic then va_fixed, va_last = abi, d.params[#d.params].name end
   function_result=sig.result
   local ret=label()
@@ -1635,12 +1738,30 @@ local function compile_function(d: headers.Declaration)
   if depth ~= 0 then fail('unbalanced expression stack') end
   if not sig.internal then assembly:push('.globl ' .. d.name) end
   assembly:push('.type ' .. d.name .. ', @function'); assembly:push(d.name .. ':')
-  local frameless=not qualified_storage and leaf.promote(&body,slots)
+  -- RDI/RSI and the full XMM6-XMM15 are nonvolatile for an MS caller.
+  -- A nested SysV call may change all of them, even through a function pointer.
+  local saved: integer = 0
+  if sig.ms_abi and (uses_string_copy or calls_sysv) then
+    saved = reserve(ct.array(Kind.UChar, calls_sysv and 176 or 16))
+  end
+  local frameless=saved == 0 and not qualified_storage and leaf.promote(&body,slots)
   if not frameless then
     assembly:push('  pushq %rbp'); assembly:push('  movq %rsp, %rbp')
     if slots > 0 then assembly:push('  subq $' .. tostring(((slots+15)//16)*16) .. ', %rsp') end
   end
+  if saved ~= 0 then
+    assembly:push('  movq %rdi, ' .. address(saved)); assembly:push('  movq %rsi, ' .. address(saved-8))
+    if calls_sysv then
+      for i = 6,15 do assembly:push(sse.frame(i,-saved+(i-5)*16,true)) end
+    end
+  end
   for i: usize=1,#body do assembly:push(body[i]) end
+  if saved ~= 0 then
+    assembly:push('  movq ' .. address(saved) .. ', %rdi'); assembly:push('  movq ' .. address(saved-8) .. ', %rsi')
+    if calls_sysv then
+      for i = 6,15 do assembly:push(sse.frame(i,-saved+(i-5)*16,false)) end
+    end
+  end
   if not frameless then assembly:push('  leave') end
   assembly:push('  ret')
   assembly:push('.size ' .. d.name .. ', .-' .. d.name)
@@ -1742,6 +1863,7 @@ local function compile_unit(path: string, destination: string, roots: *sequence(
   va_record = ct.tag('struct', '')
   ct.complete(va_record, &va_fields)
   aliases['__builtin_va_list'] = ct.array(va_record, 1)
+  aliases['__builtin_ms_va_list'] = ct.pointer(Kind.Char)
 
   assembly:push('.text')
   next_token()

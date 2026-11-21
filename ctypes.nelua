@@ -13,7 +13,7 @@ local K = ct.Kind
 
 global ct.Signature = @record{
   arity: integer, defined: boolean, internal: boolean, variadic: boolean,
-  unspecified: boolean, result: Id, parameters: sequence(Id)
+  unspecified: boolean, ms_abi: boolean, result: Id, parameters: sequence(Id)
 }
 global ct.Member = @record{name: string, kind: Id, offset: integer}
 global ct.Members = @sequence(ct.Member)
@@ -190,7 +190,7 @@ function ct.abi_parts(t: Id, parts: *[2]Id): integer
 end
 
 function ct.function_type(sig: ct.Signature): Id
-  local key = tostring(sig.result) .. (sig.unspecified and '?' or (sig.variadic and 'v' or 'f'))
+  local key = (sig.ms_abi and 'ms' or 'sysv') .. tostring(sig.result) .. (sig.unspecified and '?' or (sig.variadic and 'v' or 'f'))
   for i: usize = 1, #sig.parameters do key = key .. '/' .. tostring(sig.parameters[i]) end
   if not functions:has(key) then functions[key] = register({form=Form.Function, signature=sig}) end
   return functions[key]

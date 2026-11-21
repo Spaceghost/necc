@@ -26,4 +26,5 @@ test: $(OUT)/necc
 test-sdk: $(OUT)/necc
 	sh check-driver.sh '$(abspath $(OUT)/necc)' '$(NECC_SYSROOT)' '$(abspath $(OUT)/tests)'
 	sh check-sysv.sh '$(abspath $(OUT)/necc)' '$(NECC_SYSROOT)' '$(abspath $(OUT)/tests)'
+	sh check-msabi.sh '$(abspath $(OUT)/necc)' '$(NECC_SYSROOT)' '$(abspath $(OUT)/tests)'
 	sh check-runtime.sh '$(abspath $(OUT)/necc)' '$(NECC_SYSROOT)' '$(abspath $(OUT)/tests)'

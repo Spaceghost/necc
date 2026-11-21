@@ -35,4 +35,14 @@ function sse.convert(from: ct.Id, into: ct.Id): string
   end
 end
 
+-- movdqu between XMM and disp32(%rbp). The SDK assembler has neither
+-- movdqu nor names for XMM8-XMM15. REX.R supplies the high register bit.
+function sse.frame(reg: integer, disp: integer, save: boolean): string
+  local rex = reg >= 8 and '0x44,' or ''
+  local op = save and '0x7f,' or '0x6f,'
+  local m = tostring(0x85 + 8*(reg%8))
+  return '  .byte 0xf3,' .. rex .. '0x0f,' .. op .. m .. ' # movdqu XMM' .. tostring(reg) ..
+    (save and ' to frame' or ' from frame') .. '\n  .long ' .. tostring(disp)
+end
+
 return sse

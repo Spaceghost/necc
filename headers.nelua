@@ -17,7 +17,7 @@ global h.Declaration = @record{
   is_typedef: boolean, readonly: boolean, spec_count: usize
 }
 local Cursor = @record{words: *h.Tokens, at: usize, last: usize, aliases: *h.Aliases, enums: *ce.Names}
-local Specs = @record{kind: Id, internal: boolean, external: boolean, is_typedef: boolean, readonly: boolean}
+local Specs = @record{kind: Id, ms_abi: boolean, internal: boolean, external: boolean, is_typedef: boolean, readonly: boolean}
 local OpKind = @enum{Pointer=0, Array, Function}
 local Op = @record{form: OpKind, count: integer, sig: ct.Signature, params: h.Parameters}
 local Ops = @sequence(Op)
@@ -37,16 +37,31 @@ local function qualifier(s: string): boolean
   return s == 'const' or s == 'volatile' or s == 'restrict' or s == '__restrict' or s == '__restrict__'
 end
 
--- Consume the function attributes that leave the target's calling convention and layout intact.
-local function function_attribute(c: *Cursor): boolean
-  if peek(c,0) ~= '__attribute__' and peek(c,0) ~= '__attribute' then return false end
+-- Return the recognized attribute and leave other attributes to the caller.
+local function function_attribute(c: *Cursor): string
+  if peek(c,0) ~= '__attribute__' and peek(c,0) ~= '__attribute' then return '' end
   local at = c.at
   c.at = c.at + 1
-  if take(c, '(') and take(c, '(') and
-      (take(c, '__noreturn__') or take(c, 'noreturn') or take(c, '__returns_twice__') or take(c, 'returns_twice')) and
-      take(c, ')') and take(c, ')') then return true end
+  if take(c, '(') and take(c, '(') then
+    local name = peek(c,0)
+    if name == 'ms_abi' or name == '__ms_abi__' or name == 'noreturn' or name == '__noreturn__' or
+        name == 'returns_twice' or name == '__returns_twice__' then
+      c.at = c.at + 1
+      if take(c, ')') and take(c, ')') then return name end
+    end
+  end
   c.at = at
-  return false
+  return ''
+end
+
+local function attributes(c: *Cursor, ms: *boolean): boolean
+  local consumed = false
+  while true do
+    local name = function_attribute(c)
+    if #name == 0 then return consumed end
+    if name == 'ms_abi' or name == '__ms_abi__' then $ms = true end
+    consumed = true
+  end
 end
 
 local function builtin(s: string): boolean
@@ -67,7 +82,7 @@ local function identifier(s: string): boolean
 end
 
 local function specifiers(c: *Cursor): Specs <forwarddecl> end
-local function declaration(c: *Cursor, base: Id): h.Declaration <forwarddecl> end
+local function declaration(c: *Cursor, spec: Specs): h.Declaration <forwarddecl> end
 
 local function record_type(c: *Cursor, word: string): Id
   local name: string
@@ -90,7 +105,7 @@ local function record_type(c: *Cursor, word: string): Id
     local spec = specifiers(&fields)
     if spec.kind == K.Unknown then return id end
     repeat
-      local d = declaration(&fields,spec.kind)
+      local d = declaration(&fields,spec)
       if d.kind == K.Unknown then return id end
       if #d.name == 0 then
         if not ct.is_record(d.kind) then return id end
@@ -116,7 +131,7 @@ function specifiers(c: *Cursor): Specs
     if take(c,'typedef') then result.is_typedef = true
     elseif take(c,'extern') then result.external = true
     elseif take(c,'static') then result.internal = true
-    elseif function_attribute(c) then
+    elseif attributes(c,&result.ms_abi) then
     elseif take(c,'inline') or take(c,'register') or take(c,'_Noreturn') then
     elseif qualifier(w) then
       if w == 'const' then result.readonly = true end
@@ -162,18 +177,25 @@ function specifiers(c: *Cursor): Specs
   return result
 end
 
-local function declarator(c: *Cursor, ops: *Ops, name: *string): boolean
+-- Attribute positions are tracked independently of '*' nesting. For example,
+-- the convention inside (MS *factory(void)) describes the returned callback.
+local function declarator(c: *Cursor, ops: *Ops, name: *string, attrs: *sequence(usize)): boolean
   local stars: integer = 0
+  local prefix_ms = false
+  attributes(c,&prefix_ms)
   while take(c,'*') do
     stars = stars+1
-    while qualifier(peek(c,0)) do c.at = c.at+1 end
+    while qualifier(peek(c,0)) or attributes(c,&prefix_ms) do
+      if qualifier(peek(c,0)) then c.at = c.at+1 end
+    end
   end
   if peek(c,0) == '(' and peek(c,1) ~= ')' and not h.starts_type(peek(c,1),c.aliases) then
     c.at = c.at+1
-    if not declarator(c,ops,name) or not take(c,')') then return false end
+    if not declarator(c,ops,name,attrs) or not take(c,')') then return false end
   elseif identifier(peek(c,0)) then
     $name = peek(c,0); c.at = c.at+1
   end
+  local first_suffix = #($ops)+1
   while true do
     if take(c,'[') then
       local words: ce.Tokens
@@ -199,7 +221,7 @@ local function declarator(c: *Cursor, ops: *Ops, name: *string): boolean
           end
           local spec = specifiers(c)
           if spec.kind == K.Unknown then return false end
-          local arg = declaration(c,spec.kind)
+          local arg = declaration(c,spec)
           local k = arg.kind
           if k == K.Unknown or k == K.Void then return false end
           if ct.is_array(k) then k = ct.pointer(ct.element(k))
@@ -210,18 +232,29 @@ local function declarator(c: *Cursor, ops: *Ops, name: *string): boolean
         until not take(c,',')
         if not take(c,')') then return false end
       end
+      attributes(c,&op.sig.ms_abi)
       ops:push(op)
     else break end
   end
   for i = 1, stars do ops:push({form=OpKind.Pointer}) end
+  if prefix_ms then attrs:push(stars > 0 and #($ops)+1 or first_suffix) end
   return true
 end
 
-function declaration(c: *Cursor, base: Id): h.Declaration
+function declaration(c: *Cursor, spec: Specs): h.Declaration
   local result: h.Declaration
   local ops: Ops
-  if not declarator(c,&ops,&result.name) then return {} end
-  result.kind = base
+  local attrs: sequence(usize)
+  defer attrs:destroy() end
+  if spec.ms_abi then attrs:push(1) end
+  if not declarator(c,&ops,&result.name,&attrs) then return {} end
+  for i: usize = 1, #attrs do
+    local n = attrs[i]
+    while n <= #ops and ops[n].form ~= OpKind.Function do n = n+1 end
+    if n > #ops then return {} end
+    ops[n].sig.ms_abi = true
+  end
+  result.kind = spec.kind
   for i = (@integer)(#ops), 1, -1 do
     local op = ops[i]
     if op.form == OpKind.Pointer then result.kind = ct.pointer(result.kind)
@@ -242,9 +275,8 @@ function h.parse(words: *h.Tokens, aliases: *h.Aliases, enums: *ce.Names): h.Dec
   local spec = specifiers(&c)
   if spec.kind == K.Unknown then return {} end
   local count=c.at-1
-  local d = declaration(&c,spec.kind)
+  local d = declaration(&c,spec)
   d.spec_count=count
-  while function_attribute(&c) do end
   if c.at <= c.last then return {} end
   d.internal, d.external, d.is_typedef, d.readonly = spec.internal, spec.external, spec.is_typedef, spec.readonly
   return d
