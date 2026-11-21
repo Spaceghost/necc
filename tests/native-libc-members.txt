@@ -9,6 +9,7 @@ fenv
 iconv
 inet
 ipc
+locale
 memory
 mqueue
 pwd
@@ -17,7 +18,10 @@ search
 semaphore
 slocale
 spawn
+stdio
 stdio-startup
+stdio-varargs
+strfloat
 string
 sys-linux
 syscall

@@ -108,10 +108,13 @@ literals used to define Nelibc's weak allocator aliases.
 The SDK tests call across GCC and necc in both directions, including mixed
 variadic functions, stack arguments, record layout and floating-point values.
 Small structures and unions with integer or SSE fields can be passed and returned
-by value, including their stack fallback when registers run out. The native
-backend supports up to two eightbytes for these aggregates. It supports
-`long double` storage layout and uses TinyCC for programs that require the
-full Nelua-generated C dialect.
+by value, including their stack fallback when registers run out. Larger
+records made of integer, pointer and SSE fields with alignment up to eight
+bytes pass on the stack. The caller supplies storage for their return
+values. GNU empty records occupy zero bytes and consume no SysV argument
+register. Scalar `long double` uses the x87 80-bit format, 16-byte stack
+slots and the x87 return register. The arithmetic, casts and variadic calls
+are checked with GCC callers and callees.
 
 To compile the third-stage C output of the standalone Nelua subset bootstrap:
 
@@ -197,12 +200,11 @@ identical archives.
 To build more of Nelibc with necc, pass the nelinker and necc source
 directories after the output prefix. From an empty build directory, the
 graph below builds both tools against the seed SDK. The staged necc
-generates code for 28 of the 47 objects, including memory and string
-operations, character classification and conversion, account lookup,
-search, unistd, POSIX message queues and System V IPC. Twenty of these
-objects come from Nelua modules and eight from C adapters, including the
-weak stdio hooks and replaceable allocator exports. TinyCC compiles
-eight other objects and GCC supplies eleven.
+generates code for 32 of the 47 objects. Twenty-three come from Nelua
+modules and nine from C adapters. This includes locale, stdio, the variadic
+stdio adapter, and string-to-floating-point conversion. TinyCC compiles
+the memory helper, math core, exec and stdio extras objects. GCC and its
+assembler supply eleven.
 The staged nelinker writes the indexed archive and links the Lua runtime.
 The seed SDK must be on an absolute path. Relative tool and output names
 are relative to the build directory.

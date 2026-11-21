@@ -51,7 +51,7 @@ local function function_attribute(c: *Cursor, ms: *boolean, weak: *boolean): boo
     local is_weak = name == 'weak' or name == '__weak__'
     local supported = is_weak or is_ms or name == 'noreturn' or name == '__noreturn__' or
       name == 'returns_twice' or name == '__returns_twice__' or name == 'pure' or name == '__pure__' or
-      name == 'const' or name == '__const__'
+      name == 'const' or name == '__const__' or name == 'no_stack_protector' or name == '__no_stack_protector__'
     if not supported then valid = false
     else
       if is_ms then $ms = true end

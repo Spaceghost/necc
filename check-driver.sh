@@ -87,7 +87,7 @@ test ! -e ambiguous.o
 cat > attributes.c <<'C'
 int __attribute__((__pure__)) pure_prefix(int);
 __attribute__((pure)) int pure_middle(int);
-int pure_suffix(int) __attribute__((pure));
+int pure_suffix(int) __attribute__((pure, no_stack_protector));
 int __attribute__((__const__)) const_prefix(int);
 int const_suffix(int) __attribute__((const));
 int pure_prefix(int value) { return value + 1; }

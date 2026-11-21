@@ -201,10 +201,11 @@ local native_objects = {
 if native_driver then
   for _, name in ipairs({
       'alloc.nelua', 'alloc/standalone_exports.c', 'crypt_standalone.nelua', 'ctype.nelua', 'fenv_standalone.nelua',
-      'iconv_standalone.nelua', 'inet.nelua', 'ipc_adapter.c', 'memory.nelua',
+      'iconv_standalone.nelua', 'inet.nelua', 'ipc_adapter.c', 'locale_standalone.nelua', 'memory.nelua',
       'mqueue_adapter.c', 'pwd_standalone.nelua', 'regex_standalone.nelua',
       'search_standalone.nelua', 'spawn_standalone.nelua',
-      'stdio_startup_stub.c', 'string.nelua', 'termios_standalone.nelua', 'thread.nelua', 'unistd.nelua',
+      'stdio.nelua', 'stdio_startup_stub.c', 'stdio_varargs.c', 'stdlib_float.nelua',
+      'string.nelua', 'termios_standalone.nelua', 'thread.nelua', 'unistd.nelua',
       'wordexp_standalone.nelua'}) do
     native_objects[name] = true
   end
