@@ -623,9 +623,11 @@ local function place_record(abi: *Abi, k: Id, locations: *sequence(Placement))
     -- MEMORY-class aggregates are copied to the stack as rounded eightbytes.
     -- Each piece remains associated with the original record at the call site,
     -- where load_record_piece zero-extends a short final piece safely.
+    local padding = abi.stack % 2
+    abi.stack = abi.stack + padding
     count = (ct.size(k)+7)//8
     abi.stack = abi.stack + count
-    for i = 0, count-1 do locations:push({kind=Kind.ULong}) end
+    for i = 0, count-1 do locations:push({kind=Kind.ULong, pad_before=i == 0 and padding or 0}) end
     return
   end
   if count == 0 then fail('unsupported aggregate calling convention') end
@@ -777,8 +779,8 @@ local function call(target: Expr): Expr
       if ct.long_double(args[i].kind) then
         emit('movq ' .. tostring((count-i)*8) .. '(%r10), %rax')
         emit('pushq 8(%rax)'); emit('pushq (%rax)')
-        if args[i].pad_before > 0 then emit('pushq $0') end
       else emit('pushq ' .. tostring((count-i)*8) .. '(%r10)') end
+      if args[i].pad_before > 0 then emit('pushq $0') end
     end
   end
   if abi.ms then emit('subq $32, %rsp')
@@ -1966,14 +1968,14 @@ local function compile_function(d: headers.Declaration)
       local a = incoming[j]
       local dest = address(v.slot - (@integer)(j-1)*8)
       if a.reg == 0 then
-        local parameter_offset=stack+a.pad_before
+        local parameter_offset = stack + a.pad_before
         emit('movq ' .. tostring((abi.ms and 48 or 16) + parameter_offset*8) .. '(%rbp), %rax')
         emit('movq %rax, ' .. dest)
         if ct.long_double(a.kind) then
           emit('movq ' .. tostring((abi.ms and 56 or 24) + parameter_offset*8) .. '(%rbp), %rax')
           emit('movq %rax, ' .. address(v.slot-8))
           stack = stack + a.pad_before + 2
-        else stack = stack + 1 end
+        else stack = stack + a.pad_before + 1 end
       elseif ct.floating(a.kind) then
         xmm_out(a.kind, '%xmm' .. tostring(a.reg-1)); store_memory(a.kind, dest)
       else emit('movq ' .. argument_register(abi.ms,a.reg) .. ', ' .. dest) end

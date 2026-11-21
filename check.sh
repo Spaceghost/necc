@@ -195,4 +195,11 @@ reject '/* unterminated' 'unterminated comment'
     "$repo/tests/long_double_abi_main.c" "$out/long-double-abi.o" -lm -o "$out/long-double-abi"
 "$out/long-double-abi"
 
+"$necc" "$repo/tests/memory_long_double.c" -o "$out/memory-long-double.s"
+"$as" --64 "$out/memory-long-double.s" -o "$out/memory-long-double.o"
+"$cc" -std=c11 -O0 -Wall -Wextra -Werror \
+    "$repo/tests/memory_long_double_gcc.c" "$repo/tests/memory_long_double_main.c" \
+    "$out/memory-long-double.o" -o "$out/memory-long-double"
+"$out/memory-long-double"
+
 echo "necc ABI, arithmetic and invalid input checks passed in $out"

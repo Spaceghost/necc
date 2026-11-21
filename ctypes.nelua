@@ -215,11 +215,14 @@ local function memory_leaves(t: Id): boolean
     end
     return true
   end
-  return ct.is_integer(t) or ct.is_pointer(t) or ct.floating(t)
+  -- Extended precision has an x87 class, which is not available inside
+  -- register-class aggregates. Aggregates over two eightbytes containing it
+  -- are therefore passed and returned in memory; their bytes are opaque here.
+  return ct.is_integer(t) or ct.is_pointer(t) or ct.floating(t) or ct.long_double(t)
 end
 
 function ct.memory_aggregate(t: Id): boolean
-  return ct.is_record(t) and ct.size(t) > 16 and ct.align(t) <= 8 and memory_leaves(t)
+  return ct.is_record(t) and ct.size(t) > 16 and ct.align(t) <= 16 and memory_leaves(t)
 end
 
 function ct.function_type(sig: ct.Signature): Id
