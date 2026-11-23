@@ -1,0 +1,210 @@
+-- ELF64 relocatable objects for generated native code. The caller retains
+-- the assembler path for inline assembly and instructions outside x86object.
+require 'io'
+require 'memory'
+require 'string'
+require 'sequence'
+require 'hashmap'
+local x86=require 'x86object'
+local elf=@record{}
+local Bytes,Fixes=x86.Bytes,x86.Fixes
+local Sym=@record{name:string, sec:integer, pos:integer, size:integer, kind:integer, bind:integer, index:integer}
+local Section=@record{name:string, kind:integer, flags:integer, align:integer, link:integer, info:integer, entry:integer, offset:integer, bytes:Bytes, fixes:Fixes}
+local Encoding=@record{start:usize, size:usize}
+-- Section indices: text, data, rodata, stack note, three relocation tables,
+-- symbol table, symbol names, and section names. ELF reserves index zero.
+local Unit=@record{encodings:hashmap(string,Encoding), sections:[11]Section, syms:sequence(Sym), names:hashmap(string,integer), current:integer}
+
+local function raw(dst:*Bytes,s:string)
+  if #s>0 then
+    local n=#($dst); dst:resize(n+#s)
+    memory.copy(&($dst)[n+1],s.data,#s)
+  end
+end
+local function cstr(dst:*Bytes,s:string): integer
+  local pos=#($dst); raw(dst,s); dst:push(0); return pos
+end
+local function pad(dst:*Bytes, alignment:integer)
+  while #($dst)%alignment~=0 do dst:push(0) end
+end
+local function ident(name:string): boolean
+  if #name==0 then return false end
+  for i:usize=0,<#name do
+    local c=name.data[i]
+    if not ((c>=65 and c<=90) or (c>=97 and c<=122) or (i>0 and c>=48 and c<=57) or c==95 or c==46) then return false end
+  end
+  return true
+end
+local function symbol(u:*Unit,name:string): *Sym
+  local i=u.names[name]
+  if i==0 then u.syms:push({name=name}); i=#u.syms; u.names[name]=i end
+  return &u.syms[i]
+end
+local function line(u:*Unit,s:string): boolean
+  if s:subview(1,2)=='  ' then s=s:subview(3) end
+  local section=&u.sections[u.current]
+  if s:subview(-1)==':' then
+    local name=s:subview(1,-2)
+    if not ident(name) then return false end
+    local sym=symbol(u,name)
+    if sym.sec~=0 then return false end
+    sym.sec=u.current; sym.pos=#section.bytes; return true
+  end
+  -- Register moves and stack accesses recur throughout an optimized function.
+  -- Cache only relocation-free instructions, indexed into the same text section.
+  local instruction=u.current==1 and s:subview(1,1)~='.'
+  if instruction then
+    local hit,encoding=u.encodings:has_and_get(s)
+    if hit then
+      local start=#section.bytes+1
+      section.bytes:resize(#section.bytes+encoding.size)
+      memory.copy(&section.bytes[start],&section.bytes[encoding.start],encoding.size)
+      return true
+    end
+  end
+  local split=s:find(' ',1,true)
+  local op,args=s,''
+  if split>0 then op=s:subview(1,split-1); args=s:subview(split+1) end
+  if instruction then
+    local start,fixes=#section.bytes+1,#section.fixes
+    if not x86.instruction(&section.bytes,&section.fixes,op,args) then return false end
+    if #section.fixes==fixes then u.encodings[s]={start=start,size=#section.bytes+1-start} end
+    return true
+  end
+  if op=='.text' then u.current=1
+  elseif op=='.data' then u.current=2
+  elseif s=='.section .rodata' then u.current=3
+  elseif s=='.section .note.GNU-stack,"",@progbits' then u.current=4
+  elseif op=='.globl' or op=='.weak' then
+    if not ident(args) then return false end
+    local sym=symbol(u,args)
+    if sym.bind~=2 then sym.bind=op=='.weak' and 2 or 1 end
+  elseif op=='.type' or op=='.size' then
+    local sep=args:find(', ',1,true)
+    if sep==0 then return false end
+    local name,attr=args:subview(1,sep-1),args:subview(sep+2)
+    if not ident(name) then return false end
+    local sym=symbol(u,name)
+    if op=='.type' then
+      if attr=='@function' then sym.kind=2 elseif attr=='@object' then sym.kind=1 else return false end
+    else
+      if sym.sec~=u.current or attr:subview(1,2)~='.-' or attr:subview(3)~=name then return false end
+      sym.size=(@integer)(#section.bytes)-sym.pos
+    end
+  elseif op=='.space' then
+    local ok,n=x86.decimal(args)
+    -- Avoid constructing multiple in-memory copies of very large zero fills.
+    if not ok or n<0 or n>1048576 or u.current==1 then return false end
+    section.bytes:resize(#section.bytes+n)
+  elseif op=='.balign' then
+    if u.current==1 then return false end -- text alignment needs executable padding
+    local ok,n=x86.decimal(args)
+    if not ok or n<1 or n>64 or (n&(n-1))~=0 then return false end
+    pad(&section.bytes,n); if n>section.align then section.align=n end
+  elseif op=='.byte' or op=='.short' or op=='.long' or op=='.quad' then
+    local ok,n=x86.decimal(args)
+    if not ok then
+      if op~='.quad' or not ident(args) then return false end
+      section.fixes:push({offset=#section.bytes,name=args,kind=1})
+    end
+    x86.put(&section.bytes,n,op=='.byte' and 1 or (op=='.short' and 2 or (op=='.long' and 4 or 8)))
+  else return false end
+  return true
+end
+
+local function tables(u:*Unit): boolean
+  local symbols=&u.sections[8]
+  local names=&u.sections[9].bytes
+  names:push(0)
+  for i=1,3 do
+    local sec=&u.sections[i]
+    for j:usize=1,#sec.fixes do
+      local name=sec.fixes[j].name
+      if not ident(name) then return false end
+      local sym=symbol(u,name)
+      if sym.sec==0 and sym.bind==0 then sym.bind=1 end
+    end
+  end
+  x86.put(&symbols.bytes,0,8); x86.put(&symbols.bytes,0,8); x86.put(&symbols.bytes,0,8)
+  symbols.info=1
+  for pass=0,1 do
+    for i:usize=1,#u.syms do
+      local s=&u.syms[i]
+      if (s.bind==0)==(pass==0) then
+        s.index=#symbols.bytes//24
+        x86.put(&symbols.bytes,cstr(names,s.name),4)
+        x86.put(&symbols.bytes,(s.bind<<4)|s.kind,1); x86.put(&symbols.bytes,0,1)
+        x86.put(&symbols.bytes,s.sec,2); x86.put(&symbols.bytes,s.pos,8); x86.put(&symbols.bytes,s.size,8)
+        if pass==0 then symbols.info=symbols.info+1 end
+      end
+    end
+  end
+  for i=1,3 do
+    local sec=&u.sections[i]
+    local rel=&u.sections[4+i].bytes
+    for j:usize=1,#sec.fixes do
+      local fix=&sec.fixes[j]
+      local sym=&u.syms[u.names[fix.name]]
+      local addend=fix.kind==1 and 0 or -4
+      -- Same-section local PC-relative references have a fixed distance.
+      -- Global and weak references retain linker interposition semantics.
+      if sym.sec==i and sym.bind==0 and fix.kind~=1 then
+        local delta=sym.pos-(@integer)(fix.offset)+addend
+        for k=0,3 do sec.bytes[fix.offset+k+1]=(@byte)(delta>>(8*k)) end
+      else
+        x86.put(rel,fix.offset,8); x86.put(rel,(sym.index<<32)|fix.kind,8); x86.put(rel,addend,8)
+      end
+    end
+  end
+  return true
+end
+
+function elf.write(lines:*sequence(string),destination:string): boolean
+  local u:Unit
+  u.current=1
+  u.sections[1]={name='.text',kind=1,flags=6,align=1}
+  u.sections[2]={name='.data',kind=1,flags=3,align=1}
+  u.sections[3]={name='.rodata',kind=1,flags=2,align=1}
+  u.sections[4]={name='.note.GNU-stack',kind=1,align=1}
+  for i=1,3 do
+    u.sections[4+i]={name='.rela' .. u.sections[i].name,kind=4,flags=64,align=8,link=8,info=i,entry=24}
+  end
+  u.sections[8]={name='.symtab',kind=2,align=8,link=9,entry=24}
+  u.sections[9]={name='.strtab',kind=3,align=1}
+  u.sections[10]={name='.shstrtab',kind=3,align=1}
+  for i:usize=1,#($lines) do
+    local s=($lines)[i]
+    -- Raw user assembly is passed verbatim to the SDK assembler.
+    if s:subview(1,1)=='\n' or not line(&u,s) then return false end
+  end
+  if not tables(&u) then return false end
+  local offsets:[11]integer
+  local shnames=&u.sections[10].bytes
+  shnames:push(0)
+  for i=1,10 do offsets[i]=cstr(shnames,u.sections[i].name) end
+  local image:Bytes
+  raw(&image,'\x7fELF\x02\x01\x01'); x86.put(&image,0,8); image:push(0)
+  x86.put(&image,1,2); x86.put(&image,62,2); x86.put(&image,1,4)
+  x86.put(&image,0,8); x86.put(&image,0,8); x86.put(&image,0,8); x86.put(&image,0,4)
+  x86.put(&image,64,2); x86.put(&image,0,2); x86.put(&image,0,2)
+  x86.put(&image,64,2); x86.put(&image,11,2); x86.put(&image,10,2)
+  for i=1,10 do
+    local sec=&u.sections[i]
+    pad(&image,sec.align); sec.offset=#image
+    if #sec.bytes>0 then raw(&image,(@string){data=&sec.bytes[1],size=#sec.bytes}) end
+  end
+  pad(&image,8)
+  local shoff=#image
+  for k=0,7 do image[41+k]=(@byte)(shoff>>(8*k)) end
+  for i=0,10 do
+    local sec=&u.sections[i]
+    x86.put(&image,offsets[i],4); x86.put(&image,sec.kind,4); x86.put(&image,sec.flags,8)
+    x86.put(&image,0,8); x86.put(&image,sec.offset,8); x86.put(&image,#sec.bytes,8)
+    x86.put(&image,sec.link,4); x86.put(&image,sec.info,4); x86.put(&image,sec.align,8); x86.put(&image,sec.entry,8)
+  end
+  local f=io.open(destination,'wb')
+  if not f then return false end
+  local ok=f:write((@string){data=&image[1],size=#image})
+  return f:close() and ok
+end
+return elf

@@ -4,6 +4,7 @@
 require 'smallalloc'
 require 'arg'
 local driver = require 'driver'
+local elf = require 'elfobject'
 local headers = require 'headers'
 local ct = require 'ctypes'
 local fp = require 'floating'
@@ -2479,7 +2480,7 @@ local function object_type(name: string): Id
 end
 -- One translation unit per process. The driver owns temporary-file cleanup
 -- for both normal completion and diagnostics from the frontend.
-local function compile_unit(path: string, destination: string, roots: *sequence(string), builtin_copy: boolean)
+local function compile_unit(path: string, destination: string, roots: *sequence(string), builtin_copy: boolean, object: string): boolean
   optimize_memcpy=builtin_copy
   source_path=path
   header_roots=roots
@@ -2552,6 +2553,7 @@ local function compile_unit(path: string, destination: string, roots: *sequence(
   end
   assembly:push('.section .note.GNU-stack,"",@progbits')
 
+  if #object>0 and elf.write(&assembly,object) then return true end
   local output, output_error = io.open(destination, 'wb')
   if not output then fail(output_error) end
   local buffer: stringbuilder
@@ -2565,12 +2567,13 @@ local function compile_unit(path: string, destination: string, roots: *sequence(
   if #buffer>0 and not output:write(buffer:view()) then fail('could not write assembly') end
   if not output:close() then fail('could not close assembly') end
   buffer:destroy()
+  return false
 end
 
 if #arg >= 3 and arg[1] == '--cc1' then
   local roots: sequence(string)
   for i: usize=4,#arg do roots:push(arg[i]) end
-  compile_unit(arg[2],arg[3],&roots,false)
+  compile_unit(arg[2],arg[3],&roots,false,'')
 else
   driver.run(compile_unit)
 end

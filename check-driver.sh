@@ -13,6 +13,24 @@ work=$(mktemp -d "$3/necc-driver.XXXXXXXX")
 export TMPDIR="$work/tmp" TMP="$work/tmp" TEMP="$work/tmp"
 mkdir "$TMPDIR" "$work/user headers"
 cd "$work"
+# Preprocessed integer C must produce a linkable ELF without an assembler.
+mkdir no-sdk
+cat > direct.i <<'C'
+extern int adjust(int);
+int data[3] = {3, 5, 7};
+int *values = data;
+int calculate(int i) {
+    int total = 0;
+    while (i > 0) total += values[--i];
+    return adjust(total);
+}
+C
+NECC_SYSROOT="$work/no-sdk" "$necc" -c direct.i -o direct.o
+NECC_SYSROOT="$work/no-sdk" "$necc" -c direct.i -o repeat.o
+cmp direct.o repeat.o
+printf '%s\n' 'extern int calculate(int); int adjust(int x) { return x+2; } int main(void) { return calculate(3)!=17; }' > consumer.c
+"${CC:-cc}" -no-pie consumer.c direct.o -o direct-check
+./direct-check
 cat > 'user headers/answer.h' <<'C'
 #define ANSWER(x) ((x) + INC)
 C

@@ -20,7 +20,11 @@ executable after every compilation and the link succeed. Compile an individual
 source with `-c` to retain its object file.
 
 The C frontend is written in Nelua and emits x86-64 assembly using System V by default.
-For C, the SDK's static TinyCC handles preprocessing, assembly and linking.
+For native C object builds, necc encodes supported integer instructions and
+writes x86-64 ELF sections, symbols and relocations in process. File-scope
+assembly and instruction forms outside the encoder use the SDK assembler for
+the whole translation unit. TinyCC handles C preprocessing and the default
+link. `-S` still writes the native frontend's assembly listing.
 The default Nelua path uses the Spaceghost frontend and TinyCC as its C
 backend. `necc --native` sends the full frontend's generated C through necc
 for programs within its C coverage. `necc --direct program.nelua -o program`
@@ -58,7 +62,7 @@ Use an empty staging directory. For the distro, install the SDK in
 different installation. `TMPDIR` controls temporary compiler files.
 Set `NECC_NELINKER` to the absolute path of a [nelinker](https://github.com/Spaceghost/nelinker)
 executable to use it for the final static link. The SDK's TinyCC still handles
-C preprocessing and assembly.
+C preprocessing, explicit assembly inputs and assembler fallback.
 `-E`, `-S` and `-c` produce preprocessed C, native assembly and object
 files. `--emit-c` saves generated C for either Nelua frontend.
 Full Nelua builds accept `--release`, module directories with `-L`, and

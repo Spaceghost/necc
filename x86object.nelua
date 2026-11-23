@@ -1,0 +1,202 @@
+-- Encode the integer instructions issued by the native frontend. A form
+-- outside this encoder declines the whole unit before any object is published.
+require 'sequence'
+require 'hashmap'
+require 'string'
+local x86 = @record{}
+global x86.Bytes = @sequence(byte)
+global x86.Fix = @record{offset: usize, name: string, kind: integer}
+global x86.Fixes = @sequence(x86.Fix)
+
+function x86.put(out: *x86.Bytes, n: integer, width: integer)
+  for i=0,<width do out:push((@byte)(n >> (8*i))) end
+end
+
+-- Compiler-generated immediates and displacements use decimal notation.
+function x86.decimal(s: string): (boolean,integer)
+  if #s==0 then return false,0 end
+  local neg=s.data[0]==45
+  local at: usize=neg and 1 or 0
+  if at==#s then return false,0 end
+  local n: uint64
+  while at<#s do
+    local c=s.data[at]
+    if c<48 or c>57 then return false,0 end
+    n=n*10+(c-48); at=at+1
+  end
+  return true,(@integer)(neg and 0_u64-n or n)
+end
+
+local registers: hashmap(string,integer)
+local conditions: hashmap(string,integer)
+## local regs={{'al','cl','dl','bl','spl','bpl','sil','dil'},{'ax','cx','dx','bx','sp','bp','si','di'},{'eax','ecx','edx','ebx','esp','ebp','esi','edi'},{'rax','rcx','rdx','rbx','rsp','rbp','rsi','rdi'}}
+## for w,row in ipairs(regs) do for i=8,15 do row[i+1]='r'..i..({'b','w','d',''})[w] end
+## for i,r in ipairs(row) do
+registers[#[ '%'..r ]#]=#[ (w-1)*16+i ]#
+## end end
+## for i,cc in ipairs({'o','no','b','ae','e','ne','be','a','s','ns','p','np','l','ge','le','g'}) do
+conditions[#[cc]#]=#[i]#
+## end
+
+-- Registers use the x86 encoding order, 0..15. Memory operands carry
+-- a base, an optional scaled index (-1 means absent), and a displacement.
+local Op = @record{reg: integer, width: integer, mem: boolean, imm: boolean, val: integer, index: integer, scale: integer, symbol: string, rip: boolean}
+local function operand(s: string): Op
+  if #s==0 then return {reg=-1} end
+  if s.data[0]==36 then
+    local ok,n=x86.decimal(s:subview(2)); return {reg=-1,imm=ok,val=n}
+  elseif s.data[0]==37 then
+    local r=registers[s]-1
+    if r>=0 then return {reg=r%16,width=1<<(r//16)} end
+  elseif s:subview(-1)==')' then
+    local p=s:find('(',1,true)
+    if p==0 then return {reg=-1} end
+    local base=s:subview(p+1,-2)
+    local disp=s:subview(1,p-1)
+    if base=='%rip' and #disp>0 then return {mem=true,rip=true,symbol=disp} end
+    local d: integer
+    if #disp>0 then
+      local ok,n=x86.decimal(disp)
+      if not ok or n< -2147483648 or n>2147483647 then return {reg=-1} end
+      d=n
+    end
+    local idx: integer=-1
+    local scale: integer
+    local comma=base:find(',',1,true)
+    if comma>0 then
+      local second=base:find(',',comma+1,true)
+      if second==0 then return {reg=-1} end
+      idx=registers[base:subview(comma+1,second-1)]-49
+      local factor=base:subview(second+1)
+      if factor=='2' then scale=1 elseif factor=='4' then scale=2 elseif factor=='8' then scale=3 elseif factor~='1' then return {reg=-1} end
+      if idx<0 or idx==4 then return {reg=-1} end
+      base=base:subview(1,comma-1)
+    end
+    local r=registers[base]-49
+    if r>=0 then return {reg=r,mem=true,val=d,index=idx,scale=scale} end
+  end
+  return {reg=-1}
+end
+
+local function modrm(out: *x86.Bytes, fixes: *x86.Fixes, op: integer, width: integer, field: integer, rm: Op, byte_reg: boolean)
+  if width==2 then out:push(0x66) end
+  -- REX.W/R/X/B extend operand width, the reg field, index, and base.
+  local rex=0x40 | (width==8 and 8 or 0) | ((field>>3)<<2) | (rm.reg>>3)
+  if rm.mem and rm.index>=8 then rex=rex|2 end
+  if rex~=0x40 or byte_reg then out:push((@byte)(rex)) end
+  if op>255 then out:push(0x0f) end
+  out:push((@byte)(op))
+  local group=(field&7)<<3
+  if rm.rip then
+    out:push((@byte)(group|5))
+    fixes:push({offset=#($out),name=rm.symbol,kind=2}); x86.put(out,0,4)
+  elseif not rm.mem then out:push((@byte)(0xc0|group|(rm.reg&7)))
+  else
+    local base=rm.reg&7
+    local mode=rm.val==0 and base~=5 and 0 or (rm.val>=-128 and rm.val<=127 and 1 or 2)
+    local sib=base==4 or rm.index>=0
+    out:push((@byte)((mode<<6)|group|(sib and 4 or base)))
+    if sib then out:push((@byte)((rm.scale<<6)|((rm.index<0 and 4 or rm.index&7)<<3)|base)) end
+    if mode>0 then x86.put(out,rm.val,mode==1 and 1 or 4) end
+  end
+end
+
+local groups: hashmap(string,integer)
+## for i,name in ipairs({'add','or','adc','sbb','and','sub','xor','cmp'}) do
+groups[#[name]#]=#[i]#
+## end
+function x86.instruction(out: *x86.Bytes, fixes: *x86.Fixes, m: string, args: string): boolean
+  if m=='ret' then out:push(0xc3); return true
+  elseif m=='leave' then out:push(0xc9); return true
+  elseif m=='cltd' then out:push(0x99); return true
+  elseif m=='cqto' then out:push(0x48); out:push(0x99); return true
+  elseif m=='ud2' then out:push(15); out:push(11); return true
+  elseif m=='rep' and args=='movsb' then out:push(0xf3); out:push(0xa4); return true end
+  if m=='call' or m:subview(1,1)=='j' then
+    if args:subview(1,1)=='*' then
+      local r=operand(args:subview(2))
+      if r.reg<0 or (m~='call' and m~='jmp') then return false end
+      modrm(out,fixes,255,4,m=='call' and 2 or 4,r,false); return true
+    end
+    if m=='call' then out:push(0xe8) elseif m=='jmp' then out:push(0xe9)
+    else
+      local cc=conditions[m:subview(2)]
+      if cc==0 then return false end
+      out:push(15); out:push((@byte)(0x80+cc-1))
+    end
+    fixes:push({offset=#($out),name=args,kind=4}); x86.put(out,0,4); return true
+  end
+  local sep=args:find(', ',1,true)
+  local a=operand(sep>0 and args:subview(1,sep-1) or args)
+  if a.reg<0 and not a.imm then return false end
+  local b: Op={reg=-1}
+  if sep>0 then b=operand(args:subview(sep+2)); if b.reg<0 then return false end end
+  if m=='pushq' or m=='popq' then
+    if a.imm then return false end
+    if a.mem then modrm(out,fixes,m=='pushq' and 255 or 143,4,m=='pushq' and 6 or 0,a,false)
+    else
+      if a.reg>=8 then out:push(0x41) end
+      out:push((@byte)((m=='pushq' and 0x50 or 0x58)+(a.reg&7)))
+    end
+    return true
+  elseif m:subview(1,3)=='set' then
+    local cc=conditions[m:subview(4)]
+    if cc==0 or a.imm then return false end
+    modrm(out,fixes,0xf90+cc-1,1,0,a,not a.mem and a.reg>=4); return true
+  end
+  local suffix=m:subview(-1)
+  local w=suffix=='q' and 8 or (suffix=='l' and 4 or (suffix=='w' and 2 or (suffix=='b' and 1 or 0)))
+  if w==0 then return false end
+  local name=m:subview(1,-2)
+  if name=='neg' or name=='not' or name=='div' or name=='idiv' then
+    if a.imm then return false end
+    modrm(out,fixes,w==1 and 246 or 247,w,name=='not' and 2 or (name=='neg' and 3 or (name=='div' and 6 or 7)),a,w==1 and not a.mem and a.reg>=4); return true
+  end
+  if b.reg<0 then return false end
+  local byte_rex=w==1 and ((not a.imm and not a.mem and a.reg>=4) or (not b.mem and b.reg>=4))
+  if name=='mov' and a.imm then
+    if not b.mem and (w==4 or w==8) then
+      if w==8 or b.reg>=8 then out:push((@byte)(0x40|(w==8 and 8 or 0)|(b.reg>>3))) end
+      out:push((@byte)(0xb8+(b.reg&7))); x86.put(out,a.val,w); return true
+    end
+    if b.rip then return false end -- PC-relative addend includes the trailing immediate.
+    modrm(out,fixes,w==1 and 198 or 199,w,0,b,byte_rex); x86.put(out,a.val,w==8 and 4 or w); return true
+  end
+  local group=groups[name]-1
+  if group>=0 and a.imm then
+    if b.rip then return false end
+    local short=a.val>=-128 and a.val<=127 and w~=1
+    modrm(out,fixes,w==1 and 128 or (short and 131 or 129),w,group,b,byte_rex)
+    x86.put(out,a.val,(short or w==1) and 1 or (w==2 and 2 or 4)); return true
+  elseif name=='shr' or name=='shl' or name=='sar' then
+    if b.rip or (not a.imm and args:subview(1,4)~='%cl,') then return false end
+    modrm(out,fixes,(a.imm and 0xc0 or 0xd2)+(w==1 and 0 or 1),w,name=='shr' and 5 or (name=='sar' and 7 or 4),b,byte_rex)
+    if a.imm then x86.put(out,a.val,1) end
+    return true
+  elseif name=='imul' and a.imm then
+    if b.mem or w==1 then return false end
+    local short=a.val>=-128 and a.val<=127
+    modrm(out,fixes,short and 107 or 105,w,b.reg,b,false); x86.put(out,a.val,short and 1 or (w==2 and 2 or 4)); return true
+  end
+  if a.imm or (a.mem and b.mem) then return false end
+  if group>=0 or name=='mov' or name=='test' or name=='xchg' then
+    local op=group>=0 and group*8 or (name=='mov' and 0x88 or (name=='test' and 0x84 or 0x86))
+    if w~=1 then op=op+1 end
+    if a.mem then modrm(out,fixes,op+((group>=0 or name=='mov') and 2 or 0),w,b.reg,a,byte_rex)
+    else modrm(out,fixes,op,w,a.reg,b,byte_rex) end
+    return true
+  end
+  if b.mem then return false end
+  local op: integer
+  if name=='lea' and a.mem then op=0x8d
+  elseif name=='imul' then op=0xfaf
+  elseif name=='movsb' then op=0xfbe
+  elseif name=='movsw' then op=0xfbf
+  elseif name=='movsl' then op=0x63
+  elseif name=='movzb' then op=0xfb6
+  elseif name=='movzw' then op=0xfb7
+  else return false end
+  modrm(out,fixes,op,w,b.reg,a,(name=='movsb' or name=='movzb') and not a.mem and a.reg>=4)
+  return true
+end
+return x86

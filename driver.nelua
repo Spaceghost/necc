@@ -200,7 +200,7 @@ local function link_program(inputs: *Args, output: string, sdk: string, backend:
   driver.finish(0)
 end
 
-function driver.run(frontend: function(string,string,*Args,boolean)): void <noreturn>
+function driver.run(frontend: function(string,string,*Args,boolean,string):boolean): void <noreturn>
   if #arg == 0 then usage(); driver.finish(2) end
   if arg[1] == '--help' or arg[1] == '-h' then usage(); driver.finish(0) end
   local sdk = env('NECC_SYSROOT', '/usr/lib/necc')
@@ -300,7 +300,7 @@ function driver.run(frontend: function(string,string,*Args,boolean)): void <nore
   -- Keep the original preprocessed-C to assembly invocation usable with just necc.
   if mode == '-S' and (ext == '.i' or (ext == '.c' and #options + #system_dirs == 0 and access(tcc, 1) ~= 0)) then
     local publish = temporary(directory(parent(destination)), 'result')
-    frontend(input, publish, &system_dirs, builtin_copy)
+    frontend(input, publish, &system_dirs, builtin_copy, '')
     if not os.rename(publish, destination) then die('cannot install ' .. destination) end
     driver.finish(0)
   end
@@ -350,12 +350,13 @@ function driver.run(frontend: function(string,string,*Args,boolean)): void <nore
           run(tcc, flags)
         end
         if mode ~= '-E' then
+          local emitted = false
           local asm = input
           if ext ~= '.s' then
             asm = mode == '-S' and result or temporary(work, 'input.s')
-            frontend(preprocessed, asm, &system_dirs, builtin_copy)
+            emitted = frontend(preprocessed, asm, &system_dirs, builtin_copy, mode == '-S' and '' or obj)
           end
-          if mode ~= '-S' then
+          if mode ~= '-S' and not emitted then
             if ext == '.s' then
               run(tcc, {'-B' .. sdk .. '/tcc', '-c', asm, '-o', obj})
             else
