@@ -222,4 +222,9 @@ grep -q '^  call seventh$' "$out/small-calls.s"
     "$out/small-calls.o" -o "$out/small-calls"
 "$out/small-calls"
 
+"$necc" "$repo/tests/builtin_memcpy.c" -o "$out/builtin-memcpy.s"
+"$as" --64 "$out/builtin-memcpy.s" -o "$out/builtin-memcpy.o"
+"$cc" "$out/builtin-memcpy.o" -o "$out/builtin-memcpy"
+"$out/builtin-memcpy"
+
 echo "necc ABI, arithmetic and invalid input checks passed in $out"

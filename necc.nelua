@@ -1160,6 +1160,40 @@ local function variadic_builtin(op: string): Expr
   return {kind=Kind.Void}
 end
 
+-- Keep the two addresses alive while evaluating the count, which can itself call
+-- a function. Small fixed copies use exact-width unaligned x86 loads and stores.
+local function builtin_memcpy(): Expr
+  local pointer_kind=ct.pointer(Kind.Void)
+  expect('(')
+  convert(expression(2),pointer_kind,false); push_result()
+  expect(',')
+  convert(expression(2),pointer_kind,false); push_result()
+  expect(',')
+  local start=#body
+  local count=expression(2)
+  local fixed=count.literal and count.mark==start+1 and #body==count.mark
+  local n=count.number
+  expect(')')
+  if fixed and (n==0 or n==1 or n==2 or n==4 or n==8 or n==16) then
+    body:pop()
+    pop_result('%rcx'); pop_result('%rax')
+    if n==1 then emit('movb (%rcx), %dl'); emit('movb %dl, (%rax)')
+    elseif n==2 then emit('movw (%rcx), %dx'); emit('movw %dx, (%rax)')
+    elseif n==4 then emit('movl (%rcx), %edx'); emit('movl %edx, (%rax)')
+    elseif n>=8 then
+      emit('movq (%rcx), %rdx'); emit('movq %rdx, (%rax)')
+      if n==16 then emit('movq 8(%rcx), %rdx'); emit('movq %rdx, 8(%rax)') end
+    end
+  else
+    convert(count,Kind.ULong,false)
+    uses_string_copy=true
+    emit('movq %rax, %rcx')
+    pop_result('%rsi'); pop_result('%rdi')
+    emit('movq %rdi, %rax'); emit('rep movsb')
+  end
+  return {kind=pointer_kind}
+end
+
 function unary(): Expr
   local op=token
   if op == '__builtin_va_start' or op == '__builtin_va_arg' or op == '__builtin_va_copy' or op == '__builtin_va_end' or
@@ -1200,6 +1234,7 @@ function unary(): Expr
   elseif take('!') then
     condition(unary()); emit('sete %al'); emit('movzbl %al, %eax')
     return {kind=Kind.Int}
+  elseif take('__builtin_memcpy') then return postfix(builtin_memcpy())
   elseif take('__builtin_thread_pointer') then
     expect('('); expect(')')
     -- Linux x86-64 keeps the thread control block's self pointer at FS:0.
@@ -1231,7 +1266,7 @@ function unary(): Expr
     if not ct.is_complete(k) then fail('size requires a complete object type') end
     local n=op == 'sizeof' and ct.size(k) or ct.align(k)
     immediate(n)
-    return {kind=Kind.ULong}
+    return {kind=Kind.ULong,literal=true,number=n,mark=#body}
   elseif take('(') then
     if take('{') then return postfix(statement_expression()) end
     if headers.starts_type(token,&aliases) and locals[token].level == 0 then

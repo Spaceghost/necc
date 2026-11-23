@@ -203,6 +203,12 @@ arguments must have integer type; atomic `_Bool` operands and pointer arithmetic
 are diagnosed as unsupported. Pointer-valued load/store/exchange/compare-
 exchange are supported when their types are compatible.
 
+Native C supports `__builtin_memcpy(dst, src, n)`. It returns the destination
+pointer. For fixed sizes of 1, 2, 4, 8 or 16 bytes it emits unaligned
+integer loads and stores. A zero-byte copy evaluates the arguments without
+accessing memory. Variable sizes use `rep movsb`. Ordinary `memcpy` remains
+a library call. LZ4 can select the builtin with `-DLZ4_memcpy=__builtin_memcpy`.
+
 The generated C files have stable names so object metadata is reproducible.
 Each archive member fits the staged archiver's 15-byte name limit. Two clean
 builds in separate output directories with the same source and tools produce
