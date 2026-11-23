@@ -1,0 +1,65 @@
+-- Templates for bounded, straight-line private SysV calls. Frame references
+-- are relative to a scratch area in the enclosing function. Every expansion
+-- finishes before another call site can reuse that area.
+require 'hashmap'
+require 'sequence'
+require 'string'
+local smallinline = @record{}
+local Insn = @record{text: string, prefix: string, suffix: string, offset: integer}
+local Template = @record{code: sequence(Insn), frame: integer}
+local templates: hashmap(string, Template)
+local scratch_base: integer
+local scratch_size: integer
+
+function smallinline.begin_function()
+  scratch_base,scratch_size=0,0
+end
+
+function smallinline.remember(name: string, code: *sequence(string), frame: integer)
+  -- Exclude the final common return label. Internal labels and all control
+  -- transfers except ordinary calls stay in the out-of-line implementation.
+  -- At most 20 instructions plus the return label, and 64 bytes of locals.
+  if #($code)>21 or frame>64 then return end
+  local t: Template
+  for i: usize=1,<#($code) do
+    local line=($code)[i]
+    local first=line:byte(3)
+    if first=='.'_b or first=='j'_b or line:find('%rsp',1,true)>0 then
+      t.code:destroy(); return
+    end
+    local ins: Insn={text=line}
+    local bp=line:find('%rbp',1,true)
+    if bp>0 then
+      local digit=bp-2
+      local start=digit
+      while start>0 and line:byte(start)>=48 and line:byte(start)<=57 do start=start-1 end
+      if digit<=start or start<2 or line:byte(start)~='-'_b or line:byte(bp-1)~='('_b then
+        t.code:destroy(); return
+      end
+      for pos=start+1,digit do ins.offset=10*ins.offset+line:byte(pos)-48 end
+      if ins.offset<1 or ins.offset>frame then t.code:destroy(); return end
+      ins.prefix,ins.suffix=line:subview(1,start-1),line:subview(bp-1)
+    end
+    t.code:push(ins)
+  end
+  t.frame=frame
+  templates[name]=t
+end
+
+function smallinline.expand(name: string, code: *sequence(string), slots: *integer): boolean
+  local found,t=templates:has_and_get(name)
+  if not found then return false end
+  if t.frame>scratch_size then
+    scratch_base=(($slots+15)//16)*16
+    scratch_size=t.frame
+    $slots=scratch_base+scratch_size
+  end
+  for i: usize=1,#t.code do
+    local ins=&t.code[i]
+    if ins.offset>0 then
+      code:push(ins.prefix .. tostring(-scratch_base-ins.offset) .. ins.suffix)
+    else code:push(ins.text) end
+  end
+  return true
+end
+return smallinline

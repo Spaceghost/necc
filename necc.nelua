@@ -8,6 +8,7 @@ local headers = require 'headers'
 local ct = require 'ctypes'
 local fp = require 'floating'
 local leaf = require 'leaf'
+local smallinline = require 'smallinline'
 local affine = require 'affine'
 local sse = require 'sse'
 local ce = require 'consteval'
@@ -532,6 +533,16 @@ local function step(k: Id): integer
   return n
 end
 
+-- RAX holds the index and RCX the base. Native x86 scales cover most C arrays.
+local function scaled_address(width: integer)
+  if width == 1 then emit('addq %rcx, %rax')
+  elseif width == 2 or width == 4 or width == 8 then
+    emit('leaq (%rcx,%rax,' .. tostring(width) .. '), %rax')
+  else
+    emit('imulq $' .. tostring(width) .. ', %rax'); emit('addq %rcx, %rax')
+  end
+end
+
 local function change(e: Expr, up: boolean, postfix: boolean): Expr
   writable(e)
   emit('movq %rax, %rcx'); load_memory(e.kind,'(%rcx)')
@@ -585,7 +596,7 @@ local function zero_local(k: Id, slot: integer)
   if off < size then emit('movb $0, ' .. address(slot-off)) end
 end
 
-local Placement = @record{kind: Id, reg: integer, pad_before: integer}
+local Placement = @record{kind: Id, reg: integer, pad_before: integer, load_row: usize}
 local Abi = @record{ms: boolean, gp: integer, sse: integer, stack: integer}
 
 -- INTEGER and SSE arguments have independent register sequences in SysV.
@@ -838,6 +849,42 @@ local function atomic_builtin(name: string): Expr
   end
 end
 
+-- A trailing group of independent scalar loads can target the ABI registers
+-- directly. Earlier expressions keep their stack snapshots across nested calls.
+local function argument_load(line: string): boolean
+  if line:subview(1,5) ~= '  mov' and line:subview(1,6) ~= '  leaq' then return false end
+  local source=line:subview(1,-7) -- strip ", %rax" or ", %eax"
+  local dest=line:subview(-6)
+  return (dest==', %rax' or dest==', %eax') and
+    (source:subview(-6)=='(%rbp)' or source:subview(-6)=='(%rip)' or
+     source:subview(1,8)=='  movl $' or source:subview(1,8)=='  movq $')
+end
+
+local function place_direct_loads(args: *sequence(Placement), ms: boolean): integer
+  local count=(@integer)(#($args))
+  local staged=count
+  -- Empty SysV record arguments have no placement but can emit side effects.
+  -- Compact only snapshots still adjacent to the end of the argument list.
+  local endrow=#body
+  while staged>0 and endrow>=2 and ($args)[staged].load_row==endrow-1 do
+    staged=staged-1
+    endrow=endrow-2
+  end
+  local loads=count-staged
+  local start=endrow
+  for i: integer=1,loads do
+    local line=body[start+2*i-1]
+    local reg=argument_register(ms,($args)[staged+i].reg)
+    if line:subview(-4)=='%eax' then
+      reg=reg=='%r8' and '%r8d' or (reg=='%r9' and '%r9d' or '%e' .. reg:subview(3))
+    end
+    body[start+i]=line:subview(1,-5) .. reg
+  end
+  for i: integer=1,loads do body:pop() end
+  depth=depth-loads
+  return staged
+end
+
 local function call(target: Expr): Expr
   if target.symbol == '__atomic_load_n' or target.symbol == '__atomic_store_n' or
      target.symbol == '__atomic_exchange_n' or target.symbol == '__atomic_fetch_add' or
@@ -869,6 +916,7 @@ local function call(target: Expr): Expr
   end
   if not take(')') then
     repeat
+      local start=#body
       local e=expression(2)
       local k: Id
       if logical_count < sig.arity then k=sig.parameters[logical_count+1]
@@ -899,7 +947,10 @@ local function call(target: Expr): Expr
           local snapshot=reserve(k)
           store_memory(k,address(snapshot)); emit('leaq ' .. address(snapshot) .. ', %rax')
         end
-        args:push(place(&abi, k)); push_result()
+        local a=place(&abi,k)
+        if a.reg~=0 and (ct.is_integer(k) or ct.is_pointer(k)) and
+            #body==start+1 and argument_load(body[#body]) then a.load_row=#body end
+        args:push(a); push_result()
       end
     until not take(',')
     expect(')')
@@ -908,7 +959,8 @@ local function call(target: Expr): Expr
   if logical_count < sig.arity then fail('wrong number of arguments for ' .. target.symbol) end
   local duplicate_fp = abi.ms and (sig.variadic or sig.unspecified)
   if abi.stack == 0 then
-    for i=count,1,-1 do
+    local staged=place_direct_loads(&args, abi.ms)
+    for i=staged,1,-1 do
       local a=args[i]
       if ct.floating(a.kind) then
         pop_result('%rax'); xmm_in(a.kind,'%xmm' .. tostring(a.reg-1))
@@ -943,7 +995,9 @@ local function call(target: Expr): Expr
   end
   if abi.ms then emit('subq $32, %rsp')
   elseif sig.variadic or sig.unspecified then emit('movl $' .. tostring(abi.sse) .. ', %eax') end
-  emit('call ' .. (direct and target.symbol or '*%r11'))
+  if not (direct and abi.stack==0 and smallinline.expand(target.symbol,&body,&slots)) then
+    emit('call ' .. (direct and target.symbol or '*%r11'))
+  end
   local reclaim=(pad and 1 or 0) + (abi.ms and 4 or 0)
   if abi.stack > 0 then
     local saved=count+(direct and 0 or 1)
@@ -985,7 +1039,7 @@ local function resolve(name: string): Expr
     elseif functions:has(name) then return {kind=ct.function_type(functions[name]),symbol=name}
     elseif enumerators:has(name) then
       local n=enumerators[name]; immediate(n)
-      return {kind=Kind.Int,null_constant=n == 0}
+      return {kind=Kind.Int,null_constant=n == 0,literal=true,number=n,mark=#body}
     elseif name == '__atomic_load_n' or name == '__atomic_store_n' or
            name == '__atomic_exchange_n' or name == '__atomic_fetch_add' or
            name == '__atomic_add_fetch' or name == '__atomic_sub_fetch' or
@@ -1013,8 +1067,7 @@ local function postfix(e: Expr): Expr
       end
       if not ct.is_pointer(e.kind) or not ct.is_integer(index.kind) then fail('invalid subscript') end
       local width=step(e.kind)
-      if width ~= 1 then emit('imulq $' .. tostring(width) .. ', %rax') end
-      emit('addq %rcx, %rax')
+      scaled_address(width)
       e={kind=ct.element(e.kind),lvalue=true}
     elseif take('.') then e=member(e,false)
     elseif take('->') then e=member(e,true)
@@ -1340,9 +1393,8 @@ local function binary(op: string, a: Expr, b: Expr): Expr
     end
     if ct.is_pointer(a.kind) and ct.is_integer(b.kind) and (op == '+' or op == '-') then
       local width=step(a.kind)
-      if width ~= 1 then emit('imulq $' .. tostring(width) .. ', %rax') end
       if op == '-' then emit('negq %rax') end
-      emit('addq %rcx, %rax'); return {kind=a.kind}
+      scaled_address(width); return {kind=a.kind}
     elseif op == '-' and ct.is_pointer(a.kind) and a.kind == b.kind then
       local width=step(a.kind)
       emit('subq %rax, %rcx'); emit('movq %rcx, %rax')
@@ -1392,6 +1444,17 @@ end
 -- and must keep its original evaluation order and saved left operand.
 local function finish_integer(op: string,a: Expr,b: Expr,mark: usize): Expr
   if #body==mark+2 and b.mark==#body and ct.is_integer(a.kind) and ct.is_integer(b.kind) then
+    if b.literal and (op == '<<' or op == '>>') then
+      local k=ct.promote(a.kind)
+      local wide=ct.size(k)==8
+      if b.number>=0 and b.number<ct.size(k)*8 then
+        body:pop(); body:pop(); depth=depth-1
+        local shift=op=='<<' and 'shl' or (ct.unsigned(k) and 'shr' or 'sar')
+        emit(shift .. (wide and 'q $' or 'l $') .. tostring(b.number) .. (wide and ', %rax' or ', %eax'))
+        normalize(k)
+        return {kind=k}
+      end
+    end
     local k=ct.common(a.kind,b.kind)
     local width=ct.size(k)
     local source: string
@@ -2153,6 +2216,7 @@ end
 
 local function compile_function(d: headers.Declaration)
   counted_loop=false
+  smallinline.begin_function()
   local sig=register_fn(d,true)
   if sig.ms_abi and ct.long_double(sig.result) then
     fail('unsupported Microsoft x64 long double result')
@@ -2234,6 +2298,9 @@ local function compile_function(d: headers.Declaration)
   local saved: integer = 0
   if sig.ms_abi and (uses_string_copy or calls_sysv) then
     saved = reserve(ct.array(Kind.UChar, calls_sysv and 176 or 16))
+  end
+  if sig.internal and not sig.variadic and not sig.ms_abi and abi.stack==0 then
+    smallinline.remember(d.name,&body,slots)
   end
   local frameless=saved == 0 and not qualified_storage and leaf.promote(&body,slots)
   if not frameless then

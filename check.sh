@@ -210,4 +210,16 @@ test "$batched" = "$(printf '%s\n' masked wrapping)"
     "$out/affine-loops.o" -o "$out/affine-loops"
 "$out/affine-loops"
 
+# Direct calls to the private straight-line helper expand, while its address
+# still denotes a callable function. Branches and stack arguments keep calls.
+"$necc" "$repo/tests/small_calls.c" -o "$out/small-calls.s"
+if grep -q '^  call read_local$' "$out/small-calls.s"; then exit 1; fi
+grep -q '^read_local:$' "$out/small-calls.s"
+grep -q '^  call conditional$' "$out/small-calls.s"
+grep -q '^  call seventh$' "$out/small-calls.s"
+"$as" --64 "$out/small-calls.s" -o "$out/small-calls.o"
+"$cc" -std=c11 -O2 -Wall -Wextra -Werror "$repo/tests/small_calls_main.c" \
+    "$out/small-calls.o" -o "$out/small-calls"
+"$out/small-calls"
+
 echo "necc ABI, arithmetic and invalid input checks passed in $out"
