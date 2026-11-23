@@ -304,6 +304,12 @@ local function apply(op: string,a: Value,b: Value): Value
   return value(yes and 1 or 0,K.Int)
 end
 
+-- Share the C promotions and overflow rules with the executable expression emitter.
+function ce.fold_binary(op: string, lhs: integer, left: Id, rhs: integer, right: Id): (boolean,integer,Id)
+  local r=apply(op,value(lhs,left),value(rhs,right))
+  return r.ok,r.n,r.kind
+end
+
 function expression(c: *Cursor, minimum: integer): Value
   local lhs = primary(c)
   while lhs.ok do

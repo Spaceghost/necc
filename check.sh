@@ -227,4 +227,22 @@ grep -q '^  call seventh$' "$out/small-calls.s"
 "$cc" "$out/builtin-memcpy.o" -o "$out/builtin-memcpy"
 "$out/builtin-memcpy"
 
+# Machine-width guards disappear while C short-circuit side effects survive.
+"$necc" "$repo/tests/constant_conditions.c" -o "$out/conditions.s"
+if sed -n '/^select_word:/,/^\.size select_word/p' "$out/conditions.s" | grep -Eq 'cmpq \$8|setne'; then exit 1; fi
+"$cc" "$out/conditions.s" -o "$out/conditions"
+"$out/conditions"
+
+# Enable the library contract for ordinary calls without rewriting the source.
+{
+    echo 'extern void *memcpy(void *, const void *, unsigned long);'
+    sed 's/__builtin_memcpy/memcpy/g' "$repo/tests/builtin_memcpy.c"
+} > "$out/library-copy.i"
+"$necc" -fbuiltin-memcpy -S "$out/library-copy.i" -o "$out/library-copy.s"
+if grep -q '^  call memcpy$' "$out/library-copy.s"; then exit 1; fi
+"$cc" "$out/library-copy.s" -o "$out/library-copy"
+"$out/library-copy"
+"$necc" -fbuiltin-memcpy -fno-builtin-memcpy -S "$out/library-copy.i" -o "$out/library-copy.s"
+grep -q '^  call memcpy$' "$out/library-copy.s"
+
 echo "necc ABI, arithmetic and invalid input checks passed in $out"

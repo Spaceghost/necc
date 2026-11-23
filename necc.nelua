@@ -27,6 +27,7 @@ local offset: isize = 1
 local line: integer = 1
 local token_line: integer = 1
 local token: string
+local optimize_memcpy: boolean
 local qualified_storage: boolean
 local Kind, Id = ct.Kind, ct.Id
 local aliases: headers.Aliases
@@ -885,6 +886,48 @@ local function place_direct_loads(args: *sequence(Placement), ms: boolean): inte
   return staged
 end
 
+-- Keep the two addresses alive while evaluating the count, which can itself call
+-- a function. Small fixed copies use exact-width unaligned x86 loads and stores.
+local function builtin_memcpy(): Expr
+  local pointer_kind=ct.pointer(Kind.Void)
+  convert(expression(2),pointer_kind,false); push_result()
+  local saved_dest=#body
+  expect(',')
+  convert(expression(2),pointer_kind,false); push_result()
+  expect(',')
+  local start=#body
+  local count=expression(2)
+  local fixed=count.literal and count.mark==start+1 and #body==count.mark
+  local n=count.number
+  expect(')')
+  if fixed and (n==0 or n==1 or n==2 or n==4 or n==8 or n==16) then
+    body:pop() -- count immediate
+    body:pop(); depth=depth-1 -- source is still in RAX
+    if #body==saved_dest+1 and argument_load(body[#body]) and body[#body]:subview(-4)=='%rax' then
+      -- This load is independent of RAX. Keep the destination there.
+      local load=body:pop()
+      body:pop(); depth=depth-1
+      body:push(load:subview(1,-5) .. '%rcx')
+    else
+      emit('movq %rax, %rcx'); pop_result('%rax')
+    end
+    if n==1 then emit('movb (%rcx), %dl'); emit('movb %dl, (%rax)')
+    elseif n==2 then emit('movw (%rcx), %dx'); emit('movw %dx, (%rax)')
+    elseif n==4 then emit('movl (%rcx), %edx'); emit('movl %edx, (%rax)')
+    elseif n>=8 then
+      emit('movq (%rcx), %rdx'); emit('movq %rdx, (%rax)')
+      if n==16 then emit('movq 8(%rcx), %rdx'); emit('movq %rdx, 8(%rax)') end
+    end
+  else
+    convert(count,Kind.ULong,false)
+    uses_string_copy=true
+    emit('movq %rax, %rcx')
+    pop_result('%rsi'); pop_result('%rdi')
+    emit('movq %rdi, %rax'); emit('rep movsb')
+  end
+  return {kind=pointer_kind}
+end
+
 local function call(target: Expr): Expr
   if target.symbol == '__atomic_load_n' or target.symbol == '__atomic_store_n' or
      target.symbol == '__atomic_exchange_n' or target.symbol == '__atomic_fetch_add' or
@@ -900,6 +943,14 @@ local function call(target: Expr): Expr
     push_result()
   end
   local sig=ct.signature(fn)
+  if optimize_memcpy and direct and target.symbol=='memcpy' then
+    local decl=functions[target.symbol]
+    local ptr=ct.pointer(Kind.Void)
+    if not decl.internal and not decl.defined and not sig.ms_abi and not sig.variadic and not sig.unspecified and
+        sig.arity==3 and sig.result==ptr and sig.parameters[1]==ptr and sig.parameters[2]==ptr and sig.parameters[3]==Kind.ULong then
+      return builtin_memcpy()
+    end
+  end
   if sig.ms_abi and ct.long_double(sig.result) then
     fail('unsupported Microsoft x64 long double result')
   end
@@ -1160,40 +1211,6 @@ local function variadic_builtin(op: string): Expr
   return {kind=Kind.Void}
 end
 
--- Keep the two addresses alive while evaluating the count, which can itself call
--- a function. Small fixed copies use exact-width unaligned x86 loads and stores.
-local function builtin_memcpy(): Expr
-  local pointer_kind=ct.pointer(Kind.Void)
-  expect('(')
-  convert(expression(2),pointer_kind,false); push_result()
-  expect(',')
-  convert(expression(2),pointer_kind,false); push_result()
-  expect(',')
-  local start=#body
-  local count=expression(2)
-  local fixed=count.literal and count.mark==start+1 and #body==count.mark
-  local n=count.number
-  expect(')')
-  if fixed and (n==0 or n==1 or n==2 or n==4 or n==8 or n==16) then
-    body:pop()
-    pop_result('%rcx'); pop_result('%rax')
-    if n==1 then emit('movb (%rcx), %dl'); emit('movb %dl, (%rax)')
-    elseif n==2 then emit('movw (%rcx), %dx'); emit('movw %dx, (%rax)')
-    elseif n==4 then emit('movl (%rcx), %edx'); emit('movl %edx, (%rax)')
-    elseif n>=8 then
-      emit('movq (%rcx), %rdx'); emit('movq %rdx, (%rax)')
-      if n==16 then emit('movq 8(%rcx), %rdx'); emit('movq %rdx, 8(%rax)') end
-    end
-  else
-    convert(count,Kind.ULong,false)
-    uses_string_copy=true
-    emit('movq %rax, %rcx')
-    pop_result('%rsi'); pop_result('%rdi')
-    emit('movq %rdi, %rax'); emit('rep movsb')
-  end
-  return {kind=pointer_kind}
-end
-
 function unary(): Expr
   local op=token
   if op == '__builtin_va_start' or op == '__builtin_va_arg' or op == '__builtin_va_copy' or op == '__builtin_va_end' or
@@ -1234,7 +1251,7 @@ function unary(): Expr
   elseif take('!') then
     condition(unary()); emit('sete %al'); emit('movzbl %al, %eax')
     return {kind=Kind.Int}
-  elseif take('__builtin_memcpy') then return postfix(builtin_memcpy())
+  elseif take('__builtin_memcpy') then expect('('); return postfix(builtin_memcpy())
   elseif take('__builtin_thread_pointer') then
     expect('('); expect(')')
     -- Linux x86-64 keeps the thread control block's self pointer at FS:0.
@@ -1351,7 +1368,10 @@ local function compare(op: string, unsigned: boolean, wide: boolean): Expr
 end
 
 local function branch(e: Expr, target: string, when_true: boolean)
-  if #e.cc>0 and #body==e.mark then
+  if e.literal and #body==e.mark then
+    body:pop()
+    if (e.number~=0)==when_true then emit('jmp ' .. target) end
+  elseif #e.cc>0 and #body==e.mark then
     body:pop(); body:pop()
     local cc=e.cc
     if not when_true then
@@ -1479,6 +1499,14 @@ end
 -- and must keep its original evaluation order and saved left operand.
 local function finish_integer(op: string,a: Expr,b: Expr,mark: usize): Expr
   if #body==mark+2 and b.mark==#body and ct.is_integer(a.kind) and ct.is_integer(b.kind) then
+    if a.literal and a.mark==mark and b.literal then
+      local ok,n,k=ce.fold_binary(op,a.number,a.kind,b.number,b.kind)
+      if ok then
+        body:pop(); body:pop(); body:pop(); depth=depth-1
+        immediate(n)
+        return {kind=k,literal=true,number=n,mark=#body}
+      end
+    end
     if b.literal and (op == '<<' or op == '>>') then
       local k=ct.promote(a.kind)
       local wide=ct.size(k)==8
@@ -1566,11 +1594,20 @@ function expression(minimum: integer): Expr
       if scalar(k) then convert(yes,k,false) end
       emit(done .. ':'); e={kind=k}
     elseif op == '&&' or op == '||' then
-      local short,done=label(),label()
-      branch(e,short,op=='||')
-      condition(expression(p+1)); emit('setne %al'); emit('movzbl %al, %eax')
-      emit('jmp ' .. done); emit(short .. ':'); immediate(op == '&&' and 0 or 1); emit(done .. ':')
-      e={kind=Kind.Int}
+      -- A constant left operand can require evaluation of the right on every path.
+      local always_rhs=e.literal and e.mark==#body and ((e.number~=0)==(op=='&&'))
+      local short,done: string
+      if always_rhs then body:pop()
+      else short,done=label(),label(); branch(e,short,op=='||') end
+      e=expression(p+1)
+      if #e.cc==0 or e.mark~=#body then
+        condition(e); emit('setne %al'); emit('movzbl %al, %eax')
+        e={kind=Kind.Int}
+      end
+      if not always_rhs then
+        emit('jmp ' .. done); emit(short .. ':'); immediate(op == '&&' and 0 or 1); emit(done .. ':')
+        e={kind=Kind.Int}
+      end
     else
       e=value(e)
       local mark=#body
@@ -2442,7 +2479,8 @@ local function object_type(name: string): Id
 end
 -- One translation unit per process. The driver owns temporary-file cleanup
 -- for both normal completion and diagnostics from the frontend.
-local function compile_unit(path: string, destination: string, roots: *sequence(string))
+local function compile_unit(path: string, destination: string, roots: *sequence(string), builtin_copy: boolean)
+  optimize_memcpy=builtin_copy
   source_path=path
   header_roots=roots
   local input, reason = io.open(source_path, 'rb')
@@ -2532,7 +2570,7 @@ end
 if #arg >= 3 and arg[1] == '--cc1' then
   local roots: sequence(string)
   for i: usize=4,#arg do roots:push(arg[i]) end
-  compile_unit(arg[2],arg[3],&roots)
+  compile_unit(arg[2],arg[3],&roots,false)
 else
   driver.run(compile_unit)
 end

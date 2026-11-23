@@ -100,7 +100,7 @@ local function run(path: string, arguments: Args, input: facultative(string))
 end
 
 local function usage()
-  io.stdout:write('usage: necc [-S|-c|-E|--emit-c] [--native|--direct] [-I DIR] [-isystem DIR] [-D NAME] FILE [-o OUTPUT]\n' ..
+  io.stdout:write('usage: necc [-S|-c|-E|--emit-c] [--native|--direct] [-fbuiltin-memcpy] [-I DIR] [-isystem DIR] [-D NAME] FILE [-o OUTPUT]\n' ..
       '       necc SOURCE|OBJECT|ARCHIVE ... [-o PROGRAM]\n' ..
       '       necc [--native] [--release] [-L DIR] [--define EXPR] FILE.nelua [-o OUTPUT]\n' ..
       '       necc SCRIPT.lua [ARG ...] | necc --lua [LUA-OPTION ...]\n' ..
@@ -157,7 +157,7 @@ end
 -- Compile independent translation units through the same -c path used by
 -- nebuild. Object and archive order is significant to the static linker.
 local function link_program(inputs: *Args, output: string, sdk: string, backend: NeluaMode,
-                            cpp: *Args, roots: *Args, nelua: *Args): void <noreturn>
+                            cpp: *Args, roots: *Args, nelua: *Args, builtin_copy: boolean): void <noreturn>
   local work = directory(env('TMPDIR', '/tmp'))
   local result = temporary(directory(parent(output)), 'program')
   local objects: Args
@@ -173,6 +173,7 @@ local function link_program(inputs: *Args, output: string, sdk: string, backend:
       local object = temporary(work, 'unit-' .. tostring(i) .. '.o')
       local args: Args = {'-c', '-o', object}
       if ext ~= '.s' then
+        if builtin_copy then args:push('-fbuiltin-memcpy') end
         has_cpp = true
         for k: usize = 1, #($cpp) do args:push(($cpp)[k]) end
         for k: usize = 1, #($roots) do args:push('-isystem'); args:push(($roots)[k]) end
@@ -199,7 +200,7 @@ local function link_program(inputs: *Args, output: string, sdk: string, backend:
   driver.finish(0)
 end
 
-function driver.run(frontend: function(string,string,*Args)): void <noreturn>
+function driver.run(frontend: function(string,string,*Args,boolean)): void <noreturn>
   if #arg == 0 then usage(); driver.finish(2) end
   if arg[1] == '--help' or arg[1] == '-h' then usage(); driver.finish(0) end
   local sdk = env('NECC_SYSROOT', '/usr/lib/necc')
@@ -219,6 +220,7 @@ function driver.run(frontend: function(string,string,*Args)): void <noreturn>
   local system_dirs: Args
   local frontend_options: Args
   local i: usize = 1
+  local builtin_copy = false
   local positional = false
   while i <= #arg do
     local option = arg[i]
@@ -242,6 +244,8 @@ function driver.run(frontend: function(string,string,*Args)): void <noreturn>
       if i > #arg then die('missing argument after ' .. option) end
       frontend_options:push(option)
       frontend_options:push(arg[i])
+    elseif not positional and (option == '-fbuiltin-memcpy' or option == '-fno-builtin-memcpy') then
+      builtin_copy = option == '-fbuiltin-memcpy'
     elseif not positional and option == '-isystem' then
       i = i + 1
       if i > #arg or #arg[i] == 0 then die('missing directory after -isystem') end
@@ -266,13 +270,16 @@ function driver.run(frontend: function(string,string,*Args)): void <noreturn>
   if #inputs > 1 or ext == '.a' then
     if #mode > 0 or extension(destination) == '.s' then die('multiple inputs and archives require executable linking') end
     if #destination == 0 then destination = 'a.out' end
-    link_program(&inputs, destination, sdk, backend, &options, &system_dirs, &frontend_options)
+    link_program(&inputs, destination, sdk, backend, &options, &system_dirs, &frontend_options, builtin_copy)
   end
   local nelua = ext == '.nelua'
   local direct = backend == NeluaMode.Direct
   if not nelua and ext ~= '.c' and ext ~= '.i' and ext ~= '.s' and ext ~= '.o' then die('unknown input language for ' .. input) end
   if #frontend_options > 0 and (not nelua or direct) then die('Nelua frontend options require a full Nelua input') end
   if backend ~= NeluaMode.Full and not nelua then die('Nelua backend options require a Nelua input') end
+  if builtin_copy and ((nelua and backend == NeluaMode.Full) or ext == '.o' or ext == '.s') then
+    die('-fbuiltin-memcpy requires a native C compilation')
+  end
   if mode == '--emit-c' and not nelua then die('--emit-c needs a Nelua input') end
   if #mode == 0 and #destination > 0 and extension(destination) == '.s' then mode = '-S' end
   if nelua and mode == '-S' and backend == NeluaMode.Full then die('use --native or --direct to emit Nelua assembly') end
@@ -293,7 +300,7 @@ function driver.run(frontend: function(string,string,*Args)): void <noreturn>
   -- Keep the original preprocessed-C to assembly invocation usable with just necc.
   if mode == '-S' and (ext == '.i' or (ext == '.c' and #options + #system_dirs == 0 and access(tcc, 1) ~= 0)) then
     local publish = temporary(directory(parent(destination)), 'result')
-    frontend(input, publish, &system_dirs)
+    frontend(input, publish, &system_dirs, builtin_copy)
     if not os.rename(publish, destination) then die('cannot install ' .. destination) end
     driver.finish(0)
   end
@@ -346,7 +353,7 @@ function driver.run(frontend: function(string,string,*Args)): void <noreturn>
           local asm = input
           if ext ~= '.s' then
             asm = mode == '-S' and result or temporary(work, 'input.s')
-            frontend(preprocessed, asm, &system_dirs)
+            frontend(preprocessed, asm, &system_dirs, builtin_copy)
           end
           if mode ~= '-S' then
             if ext == '.s' then

@@ -206,8 +206,11 @@ exchange are supported when their types are compatible.
 Native C supports `__builtin_memcpy(dst, src, n)`. It returns the destination
 pointer. For fixed sizes of 1, 2, 4, 8 or 16 bytes it emits unaligned
 integer loads and stores. A zero-byte copy evaluates the arguments without
-accessing memory. Variable sizes use `rep movsb`. Ordinary `memcpy` remains
-a library call. LZ4 can select the builtin with `-DLZ4_memcpy=__builtin_memcpy`.
+accessing memory. Variable sizes use `rep movsb`. Native C compilation keeps ordinary `memcpy`
+calls external by default. Pass `-fbuiltin-memcpy` to give direct calls with
+the standard prototype the same copy semantics as the builtin. This works
+with unchanged C sources and with `--native` Nelua builds. The last of
+`-fbuiltin-memcpy` and `-fno-builtin-memcpy` takes effect.
 
 The generated C files have stable names so object metadata is reproducible.
 Each archive member fits the staged archiver's 15-byte name limit. Two clean
