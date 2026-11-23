@@ -19,7 +19,12 @@ long accept_empty(long a, struct Empty x, long b, struct Empty y) {
     (void)y;
     return 2*a + b;
 }
+extern int always_left(int), always_right(int), choose_twice(int, unsigned);
+int on_left(int n) { return n + 2; }
+int on_right(int n) { return n * 3; }
 int main(void) {
+    assert(always_left(5) == 7 && always_right(5) == 15);
+    assert(choose_twice(5, 3U) == 9 && choose_twice(5, 4U) == 45);
     assert(empty_calls(23) == 63 && visits == 2);
     long guard = 1234567890123L;
     long expected = combine(guard + 30, -123, 0xfedcba98U, guard, 17U, -9) + 6 + guard;

@@ -217,6 +217,12 @@ if grep -q '^  call read_local$' "$out/small-calls.s"; then exit 1; fi
 grep -q '^read_local:$' "$out/small-calls.s"
 grep -q '^  call conditional$' "$out/small-calls.s"
 grep -q '^  call seventh$' "$out/small-calls.s"
+# Constant selectors inline only the selected arm. Repeated dynamic expansions
+# must keep distinct local branch targets.
+for pair in "always_left on_right" "always_right on_left"; do
+    set -- $pair
+    if sed -n "/^$1:/,/^[.]size $1,/p" "$out/small-calls.s" | grep -Eq "call ($2|choose)$|^  j"; then exit 1; fi
+done
 "$as" --64 "$out/small-calls.s" -o "$out/small-calls.o"
 "$cc" -std=c11 -O2 -Wall -Wextra -Werror "$repo/tests/small_calls_main.c" \
     "$out/small-calls.o" -o "$out/small-calls"

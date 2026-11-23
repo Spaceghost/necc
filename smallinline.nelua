@@ -1,4 +1,4 @@
--- Templates for bounded, straight-line private SysV calls. Frame references
+-- Templates for bounded private SysV calls. Frame references
 -- are relative to a scratch area in the enclosing function. Every expansion
 -- finishes before another call site can reuse that area.
 require 'hashmap'
@@ -6,7 +6,13 @@ require 'sequence'
 require 'string'
 local smallinline = @record{}
 local Insn = @record{text: string, prefix: string, suffix: string, offset: integer}
-local Template = @record{code: sequence(Insn), frame: integer}
+local Limits = @record{linear: integer, diamond: integer, frame: integer}
+local LIMITS <comptime> = Limits{linear=20, diamond=40, frame=64}
+global smallinline.Constants = @record{known:[6]boolean, values:[6]integer}
+local Template = @record{code: sequence(Insn), frame: integer, branch: usize,
+                         skip: usize, alternate: usize, jump: string,
+                         param: integer, immediate: integer}
+local arg_regs: [6]string = {'%rdi','%rsi','%rdx','%rcx','%r8','%r9'}
 local templates: hashmap(string, Template)
 local scratch_base: integer
 local scratch_size: integer
@@ -16,17 +22,35 @@ function smallinline.begin_function()
 end
 
 function smallinline.remember(name: string, code: *sequence(string), frame: integer)
-  -- Exclude the final common return label. Internal labels and all control
-  -- transfers except ordinary calls stay in the out-of-line implementation.
-  -- At most 20 instructions plus the return label, and 64 bytes of locals.
-  if #($code)>21 or frame>64 then return end
+  -- Accept a single forward conditional with two arms and one common exit.
+  -- All other internal control flow stays in the separately callable function.
+  local count=#($code)-1
+  if count>LIMITS.diamond or frame>LIMITS.frame then return end
   local t: Template
-  for i: usize=1,<#($code) do
+  local other: string
+  local exit_label=($code)[count+1]:subview(3,-2)
+  for i: usize=1,count do
     local line=($code)[i]
     local first=line:byte(3)
-    if first=='.'_b or first=='j'_b or line:find('%rsp',1,true)>0 then
-      t.code:destroy(); return
-    end
+    if first=='j'_b then
+      local space=line:find(' ',3,true)
+      local dest=line:subview(space+1)
+      if space==0 or dest:subview(1,7)~='.Lnecc_' then return end
+      if line:subview(3,5)=='jmp' then
+        if t.branch==0 or t.skip~=0 or dest~=exit_label then return end
+        t.skip=i
+      else
+        if t.branch~=0 then return end
+        t.branch=i; t.jump=line:subview(1,space); other=dest
+      end
+    elseif first=='.'_b then
+      if t.skip==0 or i~=t.skip+1 or line:subview(3)~=other .. ':' then return end
+      t.alternate=i
+    elseif line:find('%rsp',1,true)>0 then return end
+  end
+  if t.branch==0 and count>LIMITS.linear or t.branch~=0 and t.alternate==0 then return end
+  for i: usize=1,count do
+    local line=($code)[i]
     local ins: Insn={text=line}
     local bp=line:find('%rbp',1,true)
     if bp>0 then
@@ -42,11 +66,33 @@ function smallinline.remember(name: string, code: *sequence(string), frame: inte
     end
     t.code:push(ins)
   end
+  -- Recognize the ABI spills followed by an int parameter compared for equality.
+  -- Only this exact prefix can use a known argument to choose a single arm.
+  if t.branch>=3 and (t.jump=='  je ' or t.jump=='  jne ') then
+    local load=&t.code[t.branch-2]
+    local cmp=t.code[t.branch-1].text
+    if load.offset>0 and (load.prefix=='  movslq ' or load.prefix=='  movl ') and
+        (load.suffix=='(%rbp), %rax' or load.suffix=='(%rbp), %eax') and
+        cmp:subview(1,8)=='  cmpl $' and cmp:subview(-6)==', %eax' then
+      local param:integer
+      for i:usize=1,<t.branch-2 do
+        local spill=&t.code[i]
+        local reg:integer
+        for r=0,5 do
+          if spill.prefix=='  movq ' .. arg_regs[r] .. ', ' and spill.suffix=='(%rbp)' then reg=r+1; break end
+        end
+        if reg==0 then param=0; break end
+        if spill.offset==load.offset then param=reg end
+      end
+      t.param=param
+      t.immediate=tointeger(cmp:subview(9,-7))
+    end
+  end
   t.frame=frame
   templates[name]=t
 end
 
-function smallinline.expand(name: string, code: *sequence(string), slots: *integer): boolean
+function smallinline.expand(name: string, code: *sequence(string), slots: *integer, args: *smallinline.Constants, label: function():string): boolean
   local found,t=templates:has_and_get(name)
   if not found then return false end
   if t.frame>scratch_size then
@@ -54,12 +100,28 @@ function smallinline.expand(name: string, code: *sequence(string), slots: *integ
     scratch_size=t.frame
     $slots=scratch_base+scratch_size
   end
+  local specialized=t.param>0 and args.known[t.param-1]
+  local taken=false
+  local alternate,done: string
+  if specialized then
+    local equal=(@uint32)(args.values[t.param-1])==(@uint32)(t.immediate)
+    taken=equal==(t.jump=='  je ')
+  elseif t.branch>0 then alternate,done=label(),label() end
   for i: usize=1,#t.code do
     local ins=&t.code[i]
-    if ins.offset>0 then
+    if t.branch>0 and i==t.branch then
+      if not specialized then code:push(t.jump .. alternate) end
+    elseif t.skip>0 and i==t.skip then
+      if not specialized then code:push('  jmp ' .. done) end
+    elseif t.alternate>0 and i==t.alternate then
+      if not specialized then code:push('  ' .. alternate .. ':') end
+    elseif specialized and ((taken and i>t.branch and i<t.skip) or (not taken and i>t.alternate)) then
+      -- Only emit the selected arm. Preserve the comparison's register state.
+    elseif ins.offset>0 then
       code:push(ins.prefix .. tostring(-scratch_base-ins.offset) .. ins.suffix)
     else code:push(ins.text) end
   end
+  if t.branch>0 and not specialized then code:push('  ' .. done .. ':') end
   return true
 end
 return smallinline

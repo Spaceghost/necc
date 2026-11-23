@@ -207,6 +207,13 @@ arguments must have integer type; atomic `_Bool` operands and pointer arithmetic
 are diagnosed as unsupported. Pointer-valued load/store/exchange/compare-
 exchange are supported when their types are compatible.
 
+The native inliner can expand small private SysV helpers with a single
+two-way branch. If a caller passes a literal int or unsigned int to a
+recognized equality guard, only the selected arm is emitted. Dynamic
+arguments retain the branch. The x86 encoder builds its instruction-name
+lookup table with the fork's [native comptime records](https://nelua.tech/compiler/comptime/)
+when compiling necc.
+
 Native C supports `__builtin_memcpy(dst, src, n)`. It returns the destination
 pointer. For fixed sizes of 1, 2, 4, 8 or 16 bytes it emits unaligned
 integer loads and stores. A zero-byte copy evaluates the arguments without

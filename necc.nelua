@@ -957,6 +957,7 @@ local function call(target: Expr): Expr
   end
   if not sig.ms_abi then calls_sysv = true end
   local args: sequence(Placement)
+  local constants: smallinline.Constants
   local logical_count: integer = 0
   local abi: Abi = {ms=sig.ms_abi}
   local returned: integer = 0
@@ -1000,6 +1001,9 @@ local function call(target: Expr): Expr
           store_memory(k,address(snapshot)); emit('leaq ' .. address(snapshot) .. ', %rax')
         end
         local a=place(&abi,k)
+        if direct and not abi.ms and a.reg>0 and e.literal and (k==Kind.Int or k==Kind.UInt) then
+          constants.known[a.reg-1]=true; constants.values[a.reg-1]=e.number
+        end
         if a.reg~=0 and (ct.is_integer(k) or ct.is_pointer(k)) and
             #body==start+1 and argument_load(body[#body]) then a.load_row=#body end
         args:push(a); push_result()
@@ -1047,7 +1051,7 @@ local function call(target: Expr): Expr
   end
   if abi.ms then emit('subq $32, %rsp')
   elseif sig.variadic or sig.unspecified then emit('movl $' .. tostring(abi.sse) .. ', %eax') end
-  if not (direct and abi.stack==0 and smallinline.expand(target.symbol,&body,&slots)) then
+  if not (direct and abi.stack==0 and smallinline.expand(target.symbol,&body,&slots,&constants,label)) then
     emit('call ' .. (direct and target.symbol or '*%r11'))
   end
   local reclaim=(pad and 1 or 0) + (abi.ms and 4 or 0)

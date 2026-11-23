@@ -28,3 +28,16 @@ extern long accept_empty(long, struct Empty, long, struct Empty);
 long empty_calls(long n) {
     return accept_empty(n, note_empty(), 17, note_empty());
 }
+
+extern int on_left(int);
+extern int on_right(int);
+static int choose(int value, unsigned mode) {
+    if (mode == 3U) return on_left(value);
+    return on_right(value);
+}
+int always_left(int n) { return choose(n, 3U); }
+int always_right(int n) { return choose(n, 4U); }
+int choose_twice(int n, unsigned mode) {
+    int first = choose(n, mode);
+    return choose(first, mode);
+}
