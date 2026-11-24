@@ -38,3 +38,10 @@ test-libc-native:
 	test -n '$(SEED_NECC)' || { echo 'set SEED_NECC to the released bootstrap compiler' >&2; exit 2; }
 	sh check-render-libc-native.sh '$(SEED_NECC)' '$(NEBUILD)' '$(NECC_SYSROOT)' \
 		'$(NELIBC)' '$(X86_64_GCC)' '$(NELINKER_SRC)' '$(CURDIR)' '$(abspath $(OUT)/tests)'
+
+.PHONY: hosted
+hosted: $(OUT)/necc-hosted
+
+$(OUT)/necc-hosted: $(wildcard *.nelua) Makefile
+	mkdir -p "$(OUT)"
+	$(NELUA) --cache-dir '$(abspath $(OUT)/nelua-cache)' -r -D NECC_HOSTED=true -o "$@" necc.nelua

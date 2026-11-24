@@ -22,7 +22,11 @@ local Stat: type <cimport 'necc_stat', cinclude '<sys/stat.h>', nodecl, ctypedef
 local function stat(path: cstring, info: *Stat): cint <cimport, cinclude '<sys/stat.h>'> end
 local function setenv(name: cstring, value: cstring, replace: cint): cint <cimport, cinclude '<stdlib.h>'> end
 local function _exit(status: cint): void <cimport, cinclude '<unistd.h>', noreturn> end
+## if NECC_HOSTED then
+local function nelibc_errno_location(): *cint <cimport '__errno_location', cinclude '<errno.h>'> end
+## else
 local function nelibc_errno_location(): *cint <cimport, cinclude '<errno.h>'> end
+## end
 local EINTR: cint <cimport, nodecl, cinclude '<errno.h>'>
 
 local Args = @sequence(string)
@@ -103,6 +107,7 @@ local function usage()
   io.stdout:write('usage: necc [-S|-c|-E|--emit-c] [--native|--direct] [-fbuiltin-memcpy] [-I DIR] [-isystem DIR] [-D NAME] FILE [-o OUTPUT]\n' ..
       '       necc SOURCE|OBJECT|ARCHIVE ... [-o PROGRAM]\n' ..
       '       necc [--native] [--release] [-L DIR] [--define EXPR] FILE.nelua [-o OUTPUT]\n' ..
+      '       necc --aarch64 [-S|-c|-E|--emit-c] INPUT ... [-o OUTPUT]\n' ..
       '       necc SCRIPT.lua [ARG ...] | necc --lua [LUA-OPTION ...]\n' ..
       'C uses the native necc frontend. --native compiles full-frontend Nelua output through it.\n' ..
       '--direct selects the self-hosted Nelua subset frontend and native C compiler.\n' ..
@@ -200,6 +205,90 @@ local function link_program(inputs: *Args, output: string, sdk: string, backend:
   driver.finish(0)
 end
 
+local function compile_aarch64(input: string, ext: string, output: string, mode: string, work: string,
+                              cpp: *Args, roots: *Args, frontend: *Args)
+  local gcc: string = env('NECC_AARCH64_CC', '/usr/bin/gcc')
+  local source: string = input
+  if ext == '.nelua' then
+    local nelua: string = env('NECC_NELUA', '/usr/bin/nelua')
+    local quoted: string = "'" .. gcc:gsub("'", "'\\''") .. "'"
+    local generated: string = mode == '--emit-c' and output or temporary(directory(work), 'source.c')
+    local args: Args = {'--cc', quoted, '--cache-dir', work, '-c', '-o', generated}
+    for i: usize = 1, #($frontend) do args:push(($frontend)[i]) end
+    args:push(input)
+    run(nelua, args)
+    if mode == '--emit-c' then return end
+    source = generated
+  end
+
+  local flags: Args = {'-march=armv8-a', '-mno-outline-atomics', '-ffreestanding',
+    '-fno-builtin', '-fno-pie', '-fno-pic', '-fno-stack-protector', '-ftls-model=local-exec'}
+  if ext ~= '.s' then
+    for i: usize = 1, #($cpp) do flags:push(($cpp)[i]) end
+    for i: usize = 1, #($roots) do flags:push('-isystem'); flags:push(($roots)[i]) end
+  end
+  flags:push(mode); flags:push('-o'); flags:push(output); flags:push(source)
+  run(gcc, flags)
+end
+
+local function run_aarch64(inputs: *Args, output: string, mode: string,
+                          cpp: *Args, roots: *Args, frontend: *Args): void <noreturn>
+  local first: string = ($inputs)[1]
+  local ext: string = extension(first)
+  if #mode == 0 and extension(output) == '.s' then mode='-S' end
+  if #mode > 0 and #($inputs) ~= 1 then die('AArch64 compile modes require one input') end
+  if #output == 0 then
+    if #mode == 0 then output='a.out'
+    else
+      local suffix: string = '.c'
+      if mode == '-c' then suffix='.o'
+      elseif mode == '-S' then suffix='.s'
+      elseif mode == '-E' then suffix='.i' end
+      output=first:sub(1, #first - #ext) .. suffix
+    end
+  end
+  local has_nelua, has_cpp = false, false
+  for i: usize = 1, #($inputs) do
+    local input: string = ($inputs)[i]
+    protect_input(input, output)
+    local kind: string = extension(input)
+    if kind == '.nelua' then has_nelua=true; has_cpp=true
+    elseif kind == '.c' or kind == '.i' then has_cpp=true
+    elseif kind ~= '.s' and not (#mode == 0 and (kind == '.o' or kind == '.a')) then
+      die('unsupported AArch64 input for this mode: ' .. input)
+    end
+  end
+  if #($frontend)>0 and not has_nelua then die('Nelua options require a Nelua input') end
+  if #($cpp)+#($roots)>0 and (not has_cpp or mode == '--emit-c') then
+    die('C preprocessor options require preprocessing or compilation')
+  end
+  if mode == '--emit-c' and not has_nelua then die('--emit-c needs a Nelua input') end
+  if ext == '.s' and (mode == '-S' or mode == '-E') then die('incompatible options for assembly input') end
+
+  local work: string = directory(env('TMPDIR', '/tmp'))
+  local result: string = temporary(directory(parent(output)), mode == '--emit-c' and 'result.c' or 'result')
+  if #mode > 0 then
+    compile_aarch64(first, ext, result, mode, work, cpp, roots, frontend)
+  else
+    local linker: string = os.getenv('NECC_NELINKER')
+    if #linker == 0 then die('set NECC_NELINKER to link AArch64 executables') end
+    local args: Args = {'--aarch64', '-o', result}
+    for i: usize = 1, #($inputs) do
+      local input: string = ($inputs)[i]
+      local kind: string = extension(input)
+      if kind == '.o' or kind == '.a' then args:push(input)
+      else
+        local object: string = temporary(work, 'unit-' .. tostring(i) .. '.o')
+        compile_aarch64(input, kind, object, '-c', work, cpp, roots, frontend)
+        args:push(object)
+      end
+    end
+    run(linker, args)
+  end
+  if not os.rename(result, output) then die('cannot install ' .. output) end
+  driver.finish(0)
+end
+
 function driver.run(frontend: function(string,string,*Args,boolean,string):boolean): void <noreturn>
   if #arg == 0 then usage(); driver.finish(2) end
   if arg[1] == '--help' or arg[1] == '-h' then usage(); driver.finish(0) end
@@ -221,11 +310,14 @@ function driver.run(frontend: function(string,string,*Args,boolean,string):boole
   local frontend_options: Args
   local i: usize = 1
   local builtin_copy = false
+  local aarch64 = false
   local positional = false
   while i <= #arg do
     local option = arg[i]
     if not positional and option == '--' then
       positional = true
+    elseif not positional and option == '--aarch64' then
+      aarch64 = true
     elseif not positional and option == '-o' then
       i = i + 1
       if i > #arg or #destination > 0 then die('expected one output after -o') end
@@ -265,6 +357,10 @@ function driver.run(frontend: function(string,string,*Args,boolean,string):boole
     i = i + 1
   end
   if #inputs == 0 then die('missing input file') end
+  if aarch64 then
+    if backend ~= NeluaMode.Full or builtin_copy then die('native x86-64 backend options are unavailable on AArch64') end
+    run_aarch64(&inputs,destination,mode,&options,&system_dirs,&frontend_options)
+  end
   local input = inputs[1]
   local ext = extension(input)
   if #inputs > 1 or ext == '.a' then

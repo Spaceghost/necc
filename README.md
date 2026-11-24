@@ -32,6 +32,32 @@ selects the self-hosted Nelua subset frontend and the native necc C backend.
 Each path links against standalone Nelibc. The staged SDK runs without host
 Zig or GNU binutils.
 
+## AArch64 freestanding builds
+
+Build the hosted driver on Linux with the Spaceghost Nelua compiler:
+
+```sh
+make hosted NELUA=/path/to/nelua
+export NECC_NELUA=/path/to/nelua
+export NECC_NELINKER=/path/to/nelinker
+sh check-aarch64.sh build/necc-hosted
+```
+
+Run the check on Linux AArch64, including the
+[Fedora Incus guest](https://nelua.tech/compiler/#linux-arm64). The
+`--aarch64` mode uses AArch64 GCC for C and assembly and uses the full
+Nelua frontend for Nelua input. `NECC_AARCH64_CC` can select another
+AArch64 GCC executable by path. Nelinker performs the final static link.
+
+```sh
+build/necc-hosted --aarch64 -DANSWER=42 start.s main.c math.nelua -o program
+```
+
+Supply `_start` and any runtime objects or archives in the inputs. The
+driver preserves object and archive order. The standalone SDK and NeCC’s
+own native C code generator still target x86-64.
+
+
 ## Build and stage
 
 Build the initial compiler with `make NELIBC=/path/to/nelibc`. For the
